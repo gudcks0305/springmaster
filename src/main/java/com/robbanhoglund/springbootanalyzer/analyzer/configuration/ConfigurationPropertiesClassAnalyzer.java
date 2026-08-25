@@ -1,7 +1,5 @@
 package com.robbanhoglund.springbootanalyzer.analyzer.configuration;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.FieldDeclaration;
@@ -14,28 +12,19 @@ import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.type.Type;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.ConfigurationPropertiesClass;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.CustomPropertyDefinition;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import com.robbanhoglund.springbootanalyzer.analyzer.source.JavaSources;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Stream;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class ConfigurationPropertiesClassAnalyzer {
-
-    private static final Logger LOGGER =
-            LoggerFactory.getLogger(ConfigurationPropertiesClassAnalyzer.class);
 
     private static final Set<String> VALIDATION_ANNOTATIONS =
             Set.of(
@@ -50,75 +39,51 @@ public class ConfigurationPropertiesClassAnalyzer {
                     "DurationMin",
                     "DurationMax");
 
-    private final JavaParser javaParser;
     private final PropertyNameNormalizer propertyNameNormalizer;
 
     public ConfigurationPropertiesClassAnalyzer(PropertyNameNormalizer propertyNameNormalizer) {
         this.propertyNameNormalizer = propertyNameNormalizer;
-        this.javaParser =
-                new JavaParser(
-                        new ParserConfiguration()
-                                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25)
-                                .setCharacterEncoding(StandardCharsets.UTF_8));
     }
 
     public List<ConfigurationPropertiesClass> analyze(Path repositoryRoot) {
-        Path sourceRoot = repositoryRoot.resolve("src/main/java");
-        if (Files.notExists(sourceRoot)) {
-            return List.of();
-        }
+        return analyze(JavaSources.from(repositoryRoot));
+    }
 
+    /**
+     * Extracts configuration contracts from primary and dependency-overlay sources. Dependency
+     * contracts are semantic facts used to classify primary configuration; they do not generate
+     * standalone source findings here.
+     */
+    public List<ConfigurationPropertiesClass> analyze(JavaSources javaSources) {
         List<ConfigurationPropertiesClass> classes = new ArrayList<>();
-        try (Stream<Path> files = Files.walk(sourceRoot)) {
-            files.filter(Files::isRegularFile)
-                    .filter(path -> path.toString().endsWith(".java"))
-                    .sorted(Comparator.naturalOrder())
-                    .forEach(path -> analyzeSourceFile(repositoryRoot, path, classes));
-        } catch (IOException exception) {
-            LOGGER.warn(
-                    "Failed to fully scan @ConfigurationProperties classes under {};"
-                            + " returning partial results",
-                    sourceRoot,
-                    exception);
+        for (JavaSources.JavaFile sourceFile : javaSources.files()) {
+            if (sourceFile.compilationUnit() == null) {
+                continue;
+            }
+            analyzeSourceFile(sourceFile, classes);
         }
         return List.copyOf(classes);
     }
 
     private void analyzeSourceFile(
-            Path repositoryRoot, Path sourceFile, List<ConfigurationPropertiesClass> classes) {
-        try {
-            var parseResult = javaParser.parse(sourceFile);
-            if (!parseResult.isSuccessful() || parseResult.getResult().isEmpty()) {
-                return;
-            }
+            JavaSources.JavaFile sourceFile, List<ConfigurationPropertiesClass> classes) {
+        CompilationUnit compilationUnit = sourceFile.compilationUnit();
+        String packageName =
+                compilationUnit
+                        .getPackageDeclaration()
+                        .map(declaration -> declaration.getNameAsString())
+                        .orElse("");
+        Map<String, TypeDeclaration<?>> localTypes = indexLocalTypes(compilationUnit);
 
-            CompilationUnit compilationUnit = parseResult.getResult().orElseThrow();
-            String packageName =
-                    compilationUnit
-                            .getPackageDeclaration()
-                            .map(declaration -> declaration.getNameAsString())
-                            .orElse("");
-            Map<String, TypeDeclaration<?>> localTypes = indexLocalTypes(compilationUnit);
-
-            for (TypeDeclaration<?> typeDeclaration :
-                    compilationUnit.findAll(TypeDeclaration.class)) {
-                findConfigurationPropertiesClass(
-                                repositoryRoot,
-                                sourceFile,
-                                packageName,
-                                typeDeclaration,
-                                localTypes)
-                        .ifPresent(classes::add);
-            }
-        } catch (IOException exception) {
-            // Skip an individual unreadable file rather than aborting the scan.
-            LOGGER.debug("Failed to read source file {}; skipping", sourceFile, exception);
+        for (TypeDeclaration<?> typeDeclaration : compilationUnit.findAll(TypeDeclaration.class)) {
+            findConfigurationPropertiesClass(
+                            sourceFile.relativePath(), packageName, typeDeclaration, localTypes)
+                    .ifPresent(classes::add);
         }
     }
 
     private Optional<ConfigurationPropertiesClass> findConfigurationPropertiesClass(
-            Path repositoryRoot,
-            Path sourceFile,
+            String relativePath,
             String packageName,
             TypeDeclaration<?> typeDeclaration,
             Map<String, TypeDeclaration<?>> localTypes) {
@@ -147,7 +112,7 @@ public class ConfigurationPropertiesClassAnalyzer {
                 new ConfigurationPropertiesClass(
                         prefix,
                         qualifiedClassName,
-                        normalizePath(repositoryRoot, sourceFile),
+                        relativePath,
                         cleanJavadoc(
                                 typeDeclaration
                                         .getJavadocComment()
@@ -302,9 +267,5 @@ public class ConfigurationPropertiesClassAnalyzer {
     private String simpleName(String name) {
         int separatorIndex = name.lastIndexOf('.');
         return separatorIndex < 0 ? name : name.substring(separatorIndex + 1);
-    }
-
-    private String normalizePath(Path repositoryRoot, Path sourceFile) {
-        return repositoryRoot.relativize(sourceFile).toString().replace('\\', '/');
     }
 }

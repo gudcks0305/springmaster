@@ -3,10 +3,23 @@ package com.robbanhoglund.springbootanalyzer.analyzer.gradle;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.gradle.GradleExecutionFailureType;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.gradle.GradleExecutionMode;
 import com.robbanhoglund.springbootanalyzer.config.AnalyzerProperties;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -15,6 +28,8 @@ import org.springframework.stereotype.Service;
 public class GradleExecutionService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GradleExecutionService.class);
+    private static final Duration OUTPUT_DRAIN_GRACE = Duration.ofMillis(250);
+    private static final Duration PROCESS_TERMINATION_GRACE = Duration.ofMillis(500);
 
     private final GradleCommandBuilder gradleCommandBuilder;
     private final GradleExecutableLocator gradleExecutableLocator;
@@ -75,19 +90,26 @@ public class GradleExecutionService {
                             + " configured or found on PATH.",
                     null);
         }
+        GradleExecutionSupport.ExecutionFiles files = null;
+        Process process = null;
+        ExecutorService outputExecutor = null;
+        Future<?> outputFuture = null;
+        CappedOutputStream output = new CappedOutputStream(properties.maxOutputBytes());
         try {
-            GradleExecutionSupport.ExecutionFiles files =
+            files =
                     GradleExecutionSupport.prepareExecutionFiles(
                             repositoryRoot, properties, localPluginRepository);
 
             List<String> command =
-                    gradleCommandBuilder.buildCommand(
-                            executable.toString(),
-                            files.initScript(),
-                            files.reportFile(),
-                            properties.maxResolvedDependencies(),
-                            properties.allowNetwork(),
-                            properties);
+                    new ArrayList<>(
+                            gradleCommandBuilder.buildCommand(
+                                    executable.toString(),
+                                    files.initScript(),
+                                    files.reportFile(),
+                                    properties.maxResolvedDependencies(),
+                                    properties.allowNetwork(),
+                                    properties));
+            command.add(1, "-Duser.home=" + files.executionHome());
             LOGGER.info(
                     "Executing Gradle diagnostic task: executionMode={}, workspaceId={},"
                             + " reportFile={}, timeout={}, useWrapper={}",
@@ -105,19 +127,24 @@ public class GradleExecutionService {
                     .environment()
                     .putAll(
                             GradleExecutionSupport.safeEnvironment(
-                                    System.getenv(), files.gradleUserHome(), properties));
+                                    System.getenv(),
+                                    files.gradleUserHome(),
+                                    files.executionHome(),
+                                    properties));
             if (properties.javaHome() != null) {
                 processBuilder.environment().put("JAVA_HOME", properties.javaHome().toString());
             }
 
-            Process process = processBuilder.start();
-            String output =
-                    GradleExecutionSupport.readBounded(
-                            process.getInputStream(), properties.maxOutputBytes());
+            process = processBuilder.start();
+            outputExecutor = Executors.newSingleThreadExecutor(outputDaemonFactory());
+            InputStream processOutput = process.getInputStream();
+            outputFuture = outputExecutor.submit(() -> drainOutput(processOutput, output));
             boolean finished =
                     process.waitFor(properties.timeout().toMillis(), TimeUnit.MILLISECONDS);
             if (!finished) {
-                process.destroyForcibly();
+                terminateProcessTree(process);
+                closeProcessStreams(process);
+                awaitOutputDrain(outputFuture, OUTPUT_DRAIN_GRACE);
                 LOGGER.warn("Gradle diagnostic task timed out after {}", properties.timeout());
                 return new GradleExecutionResult(
                         false,
@@ -125,7 +152,7 @@ public class GradleExecutionService {
                         -1,
                         files.reportFile(),
                         files.initScript(),
-                        GradleExecutionSupport.redact(output),
+                        GradleExecutionSupport.redact(output.asString()),
                         executionLabel,
                         gradleVersion,
                         String.valueOf(javaFeatureVersion),
@@ -134,6 +161,14 @@ public class GradleExecutionService {
                         null);
             }
 
+            awaitOutputDrain(outputFuture, OUTPUT_DRAIN_GRACE);
+            if (!outputFuture.isDone()) {
+                // A repository-controlled descendant can outlive the launcher while retaining its
+                // stdout pipe. Closing our side keeps a successful parent exit from hanging.
+                closeProcessStreams(process);
+                outputFuture.cancel(true);
+            }
+            String outputMessage = output.asString();
             LOGGER.info("Gradle diagnostic task exited with code {}", process.exitValue());
             return new GradleExecutionResult(
                     process.exitValue() == 0,
@@ -141,14 +176,14 @@ public class GradleExecutionService {
                     process.exitValue(),
                     files.reportFile(),
                     files.initScript(),
-                    GradleExecutionSupport.redact(output),
+                    GradleExecutionSupport.redact(outputMessage),
                     executionLabel,
                     gradleVersion,
                     String.valueOf(javaFeatureVersion),
                     process.exitValue() == 0
                             ? GradleExecutionFailureType.NONE
                             : GradleExecutionSupport.classifyFailure(
-                                            output,
+                                            outputMessage,
                                             gradleVersion,
                                             javaFeatureVersion,
                                             gradleJavaCompatibilityService,
@@ -156,11 +191,11 @@ public class GradleExecutionService {
                                     .failureType(),
                     process.exitValue() == 0
                             ? null
-                            : conciseErrorMessage(output, gradleVersion, javaFeatureVersion),
+                            : conciseErrorMessage(outputMessage, gradleVersion, javaFeatureVersion),
                     process.exitValue() == 0
                             ? null
                             : GradleExecutionSupport.classifyFailure(
-                                            output,
+                                            outputMessage,
                                             gradleVersion,
                                             javaFeatureVersion,
                                             gradleJavaCompatibilityService,
@@ -168,6 +203,8 @@ public class GradleExecutionService {
                                     .pluginResolutionFailure());
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
+            terminateProcessTree(process);
+            closeProcessStreams(process);
             LOGGER.warn("Gradle diagnostic task interrupted");
             LOGGER.debug("Gradle diagnostic task interrupted", exception);
             return new GradleExecutionResult(
@@ -213,6 +250,140 @@ public class GradleExecutionService {
                     failureType,
                     conciseErrorMessage(message, gradleVersion, javaFeatureVersion),
                     classifiedFailure.pluginResolutionFailure());
+        } finally {
+            if (outputFuture != null && !outputFuture.isDone()) {
+                outputFuture.cancel(true);
+            }
+            if (outputExecutor != null) {
+                outputExecutor.shutdownNow();
+            }
+            GradleExecutionSupport.cleanupExecutionHome(files);
+        }
+    }
+
+    private void drainOutput(InputStream inputStream, CappedOutputStream output) {
+        try (inputStream) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = inputStream.read(buffer)) != -1) {
+                // Keep draining after the capture cap is reached. Stopping at the cap can fill the
+                // native pipe and deadlock the Gradle process.
+                output.write(buffer, 0, read);
+            }
+        } catch (IOException exception) {
+            throw new UncheckedIOException(exception);
+        }
+    }
+
+    private void awaitOutputDrain(Future<?> future, Duration grace) throws InterruptedException {
+        if (future == null || future.isDone()) {
+            return;
+        }
+        try {
+            future.get(grace.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException exception) {
+            // The caller closes the process streams and cancels the daemon drainer.
+        } catch (ExecutionException exception) {
+            LOGGER.debug("Failed while draining Gradle process output", exception.getCause());
+        }
+    }
+
+    private void terminateProcessTree(Process process) {
+        if (process == null) {
+            return;
+        }
+        List<ProcessHandle> descendants = new ArrayList<>();
+        try {
+            descendants.addAll(process.descendants().toList());
+        } catch (SecurityException | UnsupportedOperationException exception) {
+            LOGGER.debug("Unable to enumerate Gradle process descendants", exception);
+        }
+        // Request termination from leaves toward the launcher, then force any survivors. Process
+        // discovery is inherently racy, so the host sandbox remains the hard security boundary.
+        Collections.reverse(descendants);
+        descendants.forEach(this::destroyBestEffort);
+        destroyBestEffort(process.toHandle());
+        try {
+            process.waitFor(PROCESS_TERMINATION_GRACE.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+        descendants.stream().filter(ProcessHandle::isAlive).forEach(this::destroyBestEffort);
+        if (process.isAlive()) {
+            destroyBestEffort(process.toHandle());
+        }
+    }
+
+    private void destroyBestEffort(ProcessHandle processHandle) {
+        try {
+            if (processHandle.isAlive()) {
+                processHandle.destroyForcibly();
+            }
+        } catch (IllegalStateException
+                | SecurityException
+                | UnsupportedOperationException exception) {
+            LOGGER.debug("Unable to terminate Gradle process {}", processHandle.pid(), exception);
+        }
+    }
+
+    private void closeProcessStreams(Process process) {
+        if (process == null) {
+            return;
+        }
+        try {
+            process.getInputStream().close();
+        } catch (IOException exception) {
+            LOGGER.debug("Failed to close Gradle stdout", exception);
+        }
+        try {
+            process.getErrorStream().close();
+        } catch (IOException exception) {
+            LOGGER.debug("Failed to close Gradle stderr", exception);
+        }
+        try {
+            process.getOutputStream().close();
+        } catch (IOException exception) {
+            LOGGER.debug("Failed to close Gradle stdin", exception);
+        }
+    }
+
+    private ThreadFactory outputDaemonFactory() {
+        return runnable -> {
+            Thread thread = new Thread(runnable, "gradle-process-output-drainer");
+            thread.setDaemon(true);
+            return thread;
+        };
+    }
+
+    private static final class CappedOutputStream extends java.io.OutputStream {
+        private final ByteArrayOutputStream delegate = new ByteArrayOutputStream();
+        private final int maxBytes;
+        private int written;
+
+        private CappedOutputStream(int maxBytes) {
+            this.maxBytes = maxBytes;
+        }
+
+        @Override
+        public synchronized void write(int value) {
+            if (written < maxBytes) {
+                delegate.write(value);
+                written++;
+            }
+        }
+
+        @Override
+        public synchronized void write(byte[] buffer, int offset, int length) {
+            if (written >= maxBytes) {
+                return;
+            }
+            int allowed = Math.min(length, maxBytes - written);
+            delegate.write(buffer, offset, allowed);
+            written += allowed;
+        }
+
+        private synchronized String asString() {
+            return delegate.toString(StandardCharsets.UTF_8);
         }
     }
 

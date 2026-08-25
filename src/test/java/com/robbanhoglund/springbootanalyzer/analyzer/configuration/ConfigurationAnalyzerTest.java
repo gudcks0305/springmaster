@@ -669,6 +669,43 @@ public class TradingService {
                                         && !evidence.contains("ticker.overrides[saab]"));
     }
 
+    @Test
+    void resolvesPrimaryConfigurationFromDependencyOverlayConfigurationPropertiesContract()
+            throws IOException {
+        Path resources = Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Files.writeString(resources.resolve("application.properties"), "service.message=hello\n");
+        Path dependencySources =
+                Files.createDirectories(
+                        tempDir.resolve(
+                                "_springmaster_deps/shared/src/main/java/com/example/shared"));
+        Files.writeString(
+                dependencySources.resolve("ServiceProperties.java"),
+                """
+                package com.example.shared;
+
+                import org.springframework.boot.context.properties.ConfigurationProperties;
+
+                @ConfigurationProperties("service")
+                public record ServiceProperties(String message) {}
+                """);
+
+        var result = analyzer.analyze(tempDir, emptyBuildInfo());
+
+        assertThat(result.configurationAnalysis().properties())
+                .filteredOn(property -> property.name().equals("service.message"))
+                .singleElement()
+                .satisfies(
+                        property -> {
+                            assertThat(property.kind())
+                                    .isEqualTo(PropertyKind.CUSTOM_CONFIGURATION_PROPERTIES);
+                            assertThat(property.documentation()).isNotNull();
+                        });
+        assertThat(result.findings())
+                .filteredOn(finding -> "CONFIG_UNKNOWN_PROPERTY".equals(finding.ruleId()))
+                .extracting(Finding::evidence)
+                .noneMatch(evidence -> evidence != null && evidence.contains("service.message"));
+    }
+
     private BuildInfo emptyBuildInfo() {
         return new BuildInfo(
                 BuildTool.GRADLE,

@@ -111,12 +111,50 @@ tasks.register('integrationTest', Test) {
     outputs.upToDateWhen { false }
 }
 
-tasks.register('installGitHooks', Copy) {
-    from 'scripts/hooks'
-    into '.git/hooks'
-}
+// Deliberately opt-in: compilation, IDE sync, and CI must never alter a
+// checkout's Git hooks. Existing hooks can contain user-managed policy, so
+// this task refuses to replace them rather than silently overwriting them.
+tasks.register('installGitHooks') {
+    description = 'Installs repository Git hooks only when explicitly requested; never overwrites an existing hook.'
+    group = 'development'
 
-compileJava.dependsOn installGitHooks
+    inputs.dir(layout.projectDirectory.dir('scripts/hooks'))
+    outputs.upToDateWhen { false }
+
+    doLast {
+        def gitMetadata = layout.projectDirectory.file('.git').asFile
+        if (!gitMetadata.exists()) {
+            throw new GradleException(
+                'Cannot install hooks: this checkout is not a Git worktree. Install scripts/hooks manually if needed.')
+        }
+
+        def sourceDirectory = layout.projectDirectory.dir('scripts/hooks').asFile
+        def hooksPath = providers.exec {
+            workingDir = layout.projectDirectory.asFile
+            commandLine 'git', 'rev-parse', '--git-path', 'hooks'
+        }.standardOutput.asText.get().trim()
+        def hooksDirectory = file(hooksPath)
+        if (!hooksDirectory.exists() && !hooksDirectory.mkdirs()) {
+            throw new GradleException("Cannot create Git hooks directory: ${hooksDirectory}")
+        }
+
+        def hookSources = sourceDirectory.listFiles()?.findAll { source -> source.isFile() } ?: []
+        def existingTargets = hookSources.collect { source -> new File(hooksDirectory, source.name) }
+                .findAll { target -> target.exists() }
+        if (!existingTargets.isEmpty()) {
+            throw new GradleException(
+                "Refusing to overwrite existing Git hook(s): ${existingTargets.join(', ')}. Remove them yourself, then rerun installGitHooks.")
+        }
+
+        hookSources.each { source ->
+            def target = new File(hooksDirectory, source.name)
+            target.bytes = source.bytes
+            if (!target.setExecutable(true, false)) {
+                throw new GradleException("Cannot mark Git hook executable: ${target}")
+            }
+        }
+    }
+}
 
 spotless {
     java {

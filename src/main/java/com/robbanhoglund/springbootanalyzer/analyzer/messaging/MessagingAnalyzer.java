@@ -40,7 +40,7 @@ public class MessagingAnalyzer {
 
     public MessagingAnalysis analyze(JavaSources sources) {
         List<MessageListenerEndpoint> listeners = new ArrayList<>();
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() == null) {
                 continue;
             }

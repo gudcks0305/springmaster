@@ -7,6 +7,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -25,22 +26,13 @@ public final class GradleExecutionSupport {
             List.of(
                     "PATH",
                     "JAVA_HOME",
-                    "HOME",
-                    "USERPROFILE",
                     "SYSTEMROOT",
                     "TMP",
                     "TEMP",
-                    "APPDATA",
-                    "LOCALAPPDATA",
-                    "PROGRAMDATA",
                     "COMSPEC",
                     "PATHEXT",
                     "OS",
-                    "USERNAME",
-                    "USERDOMAIN",
-                    "PROCESSOR_ARCHITECTURE",
-                    "PROCESSOR_IDENTIFIER",
-                    "NUMBER_OF_PROCESSORS");
+                    "PROCESSOR_ARCHITECTURE");
     private static final List<Pattern> UNSAFE_WINDOWS_URI_PATTERNS =
             List.of(
                     Pattern.compile("uri\\(['\"]?[A-Za-z]:\\\\"),
@@ -66,18 +58,20 @@ public final class GradleExecutionSupport {
         Path tempDir = Files.createTempDirectory(repositoryRoot, "sba-gradle-");
         Path reportFile = tempDir.resolve("sba-gradle-model.json");
         Path initScript = tempDir.resolve("spring-boot-analyzer.init.gradle");
+        Path executionHome = Files.createDirectory(tempDir.resolve("home"));
         String script = initScriptContent(properties, localPluginRepository, renderer);
         validateInitScript(script);
         Files.writeString(initScript, script, StandardCharsets.UTF_8);
         Path gradleUserHome = properties.distributionCache();
         Files.createDirectories(gradleUserHome);
         writeIsolatedGradleProperties(gradleUserHome, properties);
-        return new ExecutionFiles(tempDir, reportFile, initScript, gradleUserHome);
+        return new ExecutionFiles(tempDir, reportFile, initScript, gradleUserHome, executionHome);
     }
 
     public static Map<String, String> safeEnvironment(
             Map<String, String> currentEnvironment,
             Path gradleUserHome,
+            Path executionHome,
             AnalyzerProperties.GradleProperties properties) {
         Map<String, String> environment = new LinkedHashMap<>();
         for (String key : SAFE_ENV_KEYS) {
@@ -91,7 +85,49 @@ public final class GradleExecutionSupport {
             }
         }
         environment.put("GRADLE_USER_HOME", gradleUserHome.toString());
+        // Never expose the analyzer account's real home directory to repository-controlled
+        // Gradle logic. USERPROFILE is set as well so the same isolation applies on Windows.
+        environment.put("HOME", executionHome.toString());
+        environment.put("USERPROFILE", executionHome.toString());
         return environment;
+    }
+
+    public static void cleanupExecutionHome(ExecutionFiles files) {
+        if (files == null || files.executionHome() == null) {
+            return;
+        }
+        Path executionHome = files.executionHome().toAbsolutePath().normalize();
+        Path tempDir = files.tempDir().toAbsolutePath().normalize();
+        if (!executionHome.startsWith(tempDir) || executionHome.equals(tempDir)) {
+            LOGGER.warn("Refusing to clean Gradle execution home outside its exact temp directory");
+            return;
+        }
+        try {
+            Files.walkFileTree(
+                    executionHome,
+                    new java.nio.file.SimpleFileVisitor<>() {
+                        @Override
+                        public java.nio.file.FileVisitResult visitFile(
+                                Path file, java.nio.file.attribute.BasicFileAttributes attributes)
+                                throws IOException {
+                            Files.deleteIfExists(file);
+                            return java.nio.file.FileVisitResult.CONTINUE;
+                        }
+
+                        @Override
+                        public java.nio.file.FileVisitResult postVisitDirectory(
+                                Path directory, IOException exception) throws IOException {
+                            if (exception != null) {
+                                throw exception;
+                            }
+                            Files.deleteIfExists(directory);
+                            return java.nio.file.FileVisitResult.CONTINUE;
+                        }
+                    });
+        } catch (IOException exception) {
+            LOGGER.debug(
+                    "Failed to clean isolated Gradle execution home {}", executionHome, exception);
+        }
     }
 
     public static String readBounded(InputStream inputStream, int maxBytes) throws IOException {
@@ -926,9 +962,9 @@ gradle.projectsLoaded {
             Path gradleUserHome, AnalyzerProperties.GradleProperties properties)
             throws IOException {
         Properties fileProperties = new Properties();
-        // Disable the Gradle daemon so build-aware (EXTENDED) runs do not leave a long-lived daemon
-        // JVM executing repository-controlled build logic after the analysis returns. With this set
-        // the Tooling API uses a single-use daemon that terminates when the build completes.
+        // Ask Gradle not to retain a reusable daemon after build-aware (EXTENDED) runs. Tooling API
+        // cancellation and daemon shutdown are still best effort; the host sandbox remains
+        // required.
         fileProperties.setProperty("org.gradle.daemon", "false");
         if (properties.copyHostGradleProxyProperties()) {
             Map<String, String> hostProxyProperties = hostGradleProxyProperties();
@@ -955,8 +991,26 @@ gradle.projectsLoaded {
             }
         }
         Path gradlePropertiesFile = gradleUserHome.resolve("gradle.properties");
-        try (var outputStream = Files.newOutputStream(gradlePropertiesFile)) {
-            fileProperties.store(outputStream, "Spring Boot Analyzer isolated Gradle settings");
+        Path temporaryProperties =
+                Files.createTempFile(gradleUserHome, ".sba-gradle-properties-", ".tmp");
+        try {
+            try (var outputStream = Files.newOutputStream(temporaryProperties)) {
+                fileProperties.store(outputStream, "Spring Boot Analyzer isolated Gradle settings");
+            }
+            try {
+                Files.move(
+                        temporaryProperties,
+                        gradlePropertiesFile,
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException exception) {
+                Files.move(
+                        temporaryProperties,
+                        gradlePropertiesFile,
+                        StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(temporaryProperties);
         }
     }
 
@@ -967,5 +1021,9 @@ gradle.projectsLoaded {
     }
 
     public record ExecutionFiles(
-            Path tempDir, Path reportFile, Path initScript, Path gradleUserHome) {}
+            Path tempDir,
+            Path reportFile,
+            Path initScript,
+            Path gradleUserHome,
+            Path executionHome) {}
 }

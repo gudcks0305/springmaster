@@ -1,10 +1,10 @@
 package com.robbanhoglund.springbootanalyzer.analyzer.runtime;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.BuildInfo;
+import com.robbanhoglund.springbootanalyzer.analyzer.model.BuildModuleInfo;
+import com.robbanhoglund.springbootanalyzer.analyzer.model.BuildModuleResolver;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.DetectedClass;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.Finding;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.FindingConfidence;
@@ -15,37 +15,41 @@ import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.Configu
 import com.robbanhoglund.springbootanalyzer.analyzer.model.gradle.GradleJavaToolchainModel;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.gradle.GradleModelAnalysis;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.gradle.GradleResolvedDependencyModel;
+import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.ModuleRuntimeStackAnalysis;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.RuntimeStackAnalysis;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.VirtualThreadAnalysis;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.WebStack;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import com.robbanhoglund.springbootanalyzer.analyzer.source.JavaSources;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Stream;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class RuntimeStackAnalyzer {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(RuntimeStackAnalyzer.class);
-
-    private final JavaParser javaParser =
-            new JavaParser(
-                    new ParserConfiguration()
-                            .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25)
-                            .setCharacterEncoding(StandardCharsets.UTF_8));
-
     public Result analyze(
             Path repositoryRoot,
+            BuildInfo buildInfo,
+            GradleModelAnalysis gradleModelAnalysis,
+            ConfigurationAnalysis configurationAnalysis,
+            List<DetectedClass> detectedComponents,
+            List<String> mainApplicationClasses) {
+        return analyze(
+                JavaSources.from(repositoryRoot),
+                buildInfo,
+                gradleModelAnalysis,
+                configurationAnalysis,
+                detectedComponents,
+                mainApplicationClasses);
+    }
+
+    public Result analyze(
+            JavaSources javaSources,
             BuildInfo buildInfo,
             GradleModelAnalysis gradleModelAnalysis,
             ConfigurationAnalysis configurationAnalysis,
@@ -67,7 +71,8 @@ public class RuntimeStackAnalyzer {
             javaVersion = buildInfo.javaVersionHint();
         }
 
-        RuntimeEvidence evidence = collectRuntimeEvidence(repositoryRoot, detectedComponents);
+        RuntimeEvidence evidence =
+                collectRuntimeEvidence(javaSources, detectedComponents, buildInfo, null);
         List<String> dependencyCoordinates = runtimeDependencies(buildInfo, gradleModelAnalysis);
         String configuredWebApplicationType =
                 configuredPropertyValue(configurationAnalysis, "spring.main.web-application-type");
@@ -90,12 +95,27 @@ public class RuntimeStackAnalyzer {
         VirtualThreadAnalysis virtualThreads =
                 analyzeVirtualThreads(javaVersion, configurationAnalysis, evidence);
 
+        List<ModuleRuntimeResult> moduleResults =
+                analyzeModuleRuntimeStacks(
+                        javaSources, buildInfo, configurationAnalysis, detectedComponents);
+        List<ModuleRuntimeStackAnalysis> moduleAnalyses =
+                moduleResults.stream().map(ModuleRuntimeResult::analysis).toList();
         List<Finding> findings = new ArrayList<>();
-        addVirtualThreadFindings(virtualThreads, findings);
-        addWebStackFindings(
-                dependencyCoordinates, configuredWebApplicationType, webStack, evidence, findings);
-        addJavaVersionFindings(
-                springBootVersion, javaVersion, virtualThreads.enabledByProperty(), findings);
+        if (moduleResults.size() > 1) {
+            for (ModuleRuntimeResult moduleResult : moduleResults) {
+                addModuleRuntimeFindings(moduleResult, findings);
+            }
+        } else {
+            addVirtualThreadFindings(virtualThreads, findings);
+            addWebStackFindings(
+                    dependencyCoordinates,
+                    configuredWebApplicationType,
+                    webStack,
+                    evidence,
+                    findings);
+            addJavaVersionFindings(
+                    springBootVersion, javaVersion, virtualThreads.enabledByProperty(), findings);
+        }
 
         String mainClass = mainApplicationClasses.isEmpty() ? null : mainApplicationClasses.get(0);
 
@@ -107,17 +127,16 @@ public class RuntimeStackAnalyzer {
                         webStack,
                         webStackReason,
                         virtualThreads,
-                        mainClass);
+                        mainClass,
+                        moduleAnalyses);
         return new Result(analysis, List.copyOf(findings));
     }
 
     private RuntimeEvidence collectRuntimeEvidence(
-            Path repositoryRoot, List<DetectedClass> detectedComponents) {
-        Path sourceRoot = repositoryRoot.resolve("src/main/java");
-        if (Files.notExists(sourceRoot)) {
-            return new RuntimeEvidence(false, false, false, false, false, false, List.of());
-        }
-
+            JavaSources javaSources,
+            List<DetectedClass> detectedComponents,
+            BuildInfo buildInfo,
+            String modulePath) {
         boolean scheduledDetected = false;
         boolean enableSchedulingDetected = false;
         boolean directVirtualThreadUsage = false;
@@ -125,51 +144,50 @@ public class RuntimeStackAnalyzer {
         boolean webFluxRoutingDetected = false;
         Set<String> evidence = new LinkedHashSet<>();
 
-        try (Stream<Path> files = Files.walk(sourceRoot)) {
-            for (Path file :
-                    files.filter(Files::isRegularFile)
-                            .filter(path -> path.toString().endsWith(".java"))
-                            .sorted(Comparator.naturalOrder())
-                            .toList()) {
-                String content = Files.readString(file, StandardCharsets.UTF_8);
-                String relativePath = repositoryRoot.relativize(file).toString().replace('\\', '/');
-
-                CompilationUnit compilationUnit = parseCompilationUnit(file);
-                if (hasAnnotation(compilationUnit, "Scheduled")) {
-                    scheduledDetected = true;
-                    evidence.add("@Scheduled in " + relativePath);
-                }
-                if (hasAnnotation(compilationUnit, "EnableScheduling")) {
-                    enableSchedulingDetected = true;
-                    evidence.add("@EnableScheduling in " + relativePath);
-                }
-                if (content.contains("Thread.ofVirtual(")
-                        || content.contains("Thread.startVirtualThread(")
-                        || content.contains("Executors.newVirtualThreadPerTaskExecutor(")) {
-                    directVirtualThreadUsage = true;
-                    evidence.add("Virtual thread API usage in " + relativePath);
-                }
-                if (content.contains("reactor.core.publisher.Mono")
-                        || content.contains("reactor.core.publisher.Flux")
-                        || content.contains("Mono<")
-                        || content.contains("Flux<")) {
-                    reactiveSignalDetected = true;
-                    evidence.add("Reactive types in " + relativePath);
-                }
-                if (usesWebFluxServerApi(compilationUnit)) {
-                    webFluxRoutingDetected = true;
-                    evidence.add("WebFlux routing API in " + relativePath);
-                }
+        for (JavaSources.JavaFile file : javaSources.primaryFiles()) {
+            String relativePath = file.relativePath();
+            if (modulePath != null
+                    && !modulePath.equals(
+                            BuildModuleResolver.modulePathFor(relativePath, buildInfo))) {
+                continue;
             }
-        } catch (IOException exception) {
-            LOGGER.warn(
-                    "Failed to fully scan source files for runtime stack analysis;"
-                            + " using partial evidence",
-                    exception);
+            String content = file.content();
+            CompilationUnit compilationUnit = file.compilationUnit();
+            if (hasAnnotation(compilationUnit, "Scheduled")) {
+                scheduledDetected = true;
+                evidence.add("@Scheduled in " + relativePath);
+            }
+            if (hasAnnotation(compilationUnit, "EnableScheduling")) {
+                enableSchedulingDetected = true;
+                evidence.add("@EnableScheduling in " + relativePath);
+            }
+            if (content.contains("Thread.ofVirtual(")
+                    || content.contains("Thread.startVirtualThread(")
+                    || content.contains("Executors.newVirtualThreadPerTaskExecutor(")) {
+                directVirtualThreadUsage = true;
+                evidence.add("Virtual thread API usage in " + relativePath);
+            }
+            if (content.contains("reactor.core.publisher.Mono")
+                    || content.contains("reactor.core.publisher.Flux")
+                    || content.contains("Mono<")
+                    || content.contains("Flux<")) {
+                reactiveSignalDetected = true;
+                evidence.add("Reactive types in " + relativePath);
+            }
+            if (usesWebFluxServerApi(compilationUnit)) {
+                webFluxRoutingDetected = true;
+                evidence.add("WebFlux routing API in " + relativePath);
+            }
         }
 
         boolean controllerDetected =
                 detectedComponents.stream()
+                        .filter(
+                                component ->
+                                        modulePath == null
+                                                || modulePath.equals(
+                                                        BuildModuleResolver.modulePathFor(
+                                                                component.filePath(), buildInfo)))
                         .anyMatch(
                                 component ->
                                         "REST_CONTROLLER"
@@ -189,15 +207,113 @@ public class RuntimeStackAnalyzer {
                 List.copyOf(evidence));
     }
 
-    private CompilationUnit parseCompilationUnit(Path file) {
-        try {
-            return javaParser.parse(file).getResult().orElse(null);
-        } catch (IOException exception) {
-            // Skip an individual unreadable file rather than aborting runtime stack analysis.
-            LOGGER.debug(
-                    "Failed to parse {} for runtime stack analysis; skipping", file, exception);
-            return null;
+    private List<ModuleRuntimeResult> analyzeModuleRuntimeStacks(
+            JavaSources javaSources,
+            BuildInfo buildInfo,
+            ConfigurationAnalysis configurationAnalysis,
+            List<DetectedClass> detectedComponents) {
+        Set<String> modulePaths = new LinkedHashSet<>();
+        for (JavaSources.JavaFile file : javaSources.primaryFiles()) {
+            modulePaths.add(BuildModuleResolver.modulePathFor(file.relativePath(), buildInfo));
         }
+
+        List<ModuleRuntimeResult> analyses = new ArrayList<>();
+        for (String modulePath : modulePaths) {
+            Optional<BuildModuleInfo> moduleInfo =
+                    buildInfo.modules().stream()
+                            .filter(module -> module.path().equals(modulePath))
+                            .findFirst();
+            BuildInfo scopedBuildInfo =
+                    moduleInfo
+                            .map(
+                                    module ->
+                                            new BuildInfo(
+                                                    module.buildTool(),
+                                                    module.springBootDetected(),
+                                                    module.javaVersionHint(),
+                                                    module.dependencies(),
+                                                    module.springBootVersion(),
+                                                    module.springBootVersionSource(),
+                                                    module.springBootVersionConfidence(),
+                                                    List.of(module)))
+                            .orElseGet(
+                                    () ->
+                                            new BuildInfo(
+                                                    buildInfo.buildTool(),
+                                                    false,
+                                                    null,
+                                                    List.of(),
+                                                    null,
+                                                    null,
+                                                    null));
+            RuntimeEvidence moduleEvidence =
+                    collectRuntimeEvidence(javaSources, detectedComponents, buildInfo, modulePath);
+            String configuredWebApplicationType =
+                    configuredPropertyValue(
+                            configurationAnalysis,
+                            "spring.main.web-application-type",
+                            modulePath,
+                            buildInfo);
+            WebStack moduleWebStack =
+                    determineWebStack(
+                            scopedBuildInfo.dependencies(),
+                            scopedBuildInfo,
+                            configuredWebApplicationType,
+                            moduleEvidence,
+                            detectedComponents.stream()
+                                    .filter(
+                                            component ->
+                                                    modulePath.equals(
+                                                            BuildModuleResolver.modulePathFor(
+                                                                    component.filePath(),
+                                                                    buildInfo)))
+                                    .toList());
+            String reason =
+                    determineWebStackReason(
+                            scopedBuildInfo.dependencies(),
+                            scopedBuildInfo,
+                            configuredWebApplicationType,
+                            moduleEvidence,
+                            moduleWebStack);
+            VirtualThreadAnalysis moduleVirtualThreads =
+                    analyzeVirtualThreads(
+                            scopedBuildInfo.javaVersionHint(),
+                            configuredPropertyValue(
+                                    configurationAnalysis,
+                                    "spring.threads.virtual.enabled",
+                                    modulePath,
+                                    buildInfo),
+                            configuredPropertyValue(
+                                    configurationAnalysis,
+                                    "spring.main.keep-alive",
+                                    modulePath,
+                                    buildInfo),
+                            moduleEvidence);
+            String sourcePath =
+                    javaSources.primaryFiles().stream()
+                            .map(JavaSources.JavaFile::relativePath)
+                            .filter(
+                                    path ->
+                                            modulePath.equals(
+                                                    BuildModuleResolver.modulePathFor(
+                                                            path, buildInfo)))
+                            .findFirst()
+                            .orElse(null);
+            analyses.add(
+                    new ModuleRuntimeResult(
+                            new ModuleRuntimeStackAnalysis(
+                                    modulePath,
+                                    scopedBuildInfo.springBootVersion(),
+                                    scopedBuildInfo.javaVersionHint(),
+                                    moduleWebStack,
+                                    reason),
+                            scopedBuildInfo,
+                            configuredWebApplicationType,
+                            moduleEvidence,
+                            moduleVirtualThreads,
+                            sourcePath));
+        }
+        return List.copyOf(analyses);
     }
 
     private boolean hasAnnotation(CompilationUnit compilationUnit, String annotationSimpleName) {
@@ -262,11 +378,14 @@ public class RuntimeStackAnalyzer {
         if (evidence.webFluxRoutingDetected()) {
             return WebStack.REACTIVE_WEBFLUX;
         }
+        if (buildInfo.springBootDetected()) {
+            return WebStack.NON_WEB;
+        }
         if (detectedComponents.stream()
                 .anyMatch(component -> component.componentType().name().contains("CONTROLLER"))) {
             return WebStack.SERVLET_MVC;
         }
-        return buildInfo.springBootDetected() ? WebStack.NON_WEB : WebStack.UNKNOWN;
+        return WebStack.UNKNOWN;
     }
 
     private String determineWebStackReason(
@@ -316,16 +435,20 @@ public class RuntimeStackAnalyzer {
             String javaVersion,
             ConfigurationAnalysis configurationAnalysis,
             RuntimeEvidence evidence) {
-        boolean enabledByProperty =
-                "true"
-                        .equalsIgnoreCase(
-                                configuredPropertyValue(
-                                        configurationAnalysis, "spring.threads.virtual.enabled"));
-        boolean keepAliveConfigured =
-                "true"
-                        .equalsIgnoreCase(
-                                configuredPropertyValue(
-                                        configurationAnalysis, "spring.main.keep-alive"));
+        return analyzeVirtualThreads(
+                javaVersion,
+                configuredPropertyValue(configurationAnalysis, "spring.threads.virtual.enabled"),
+                configuredPropertyValue(configurationAnalysis, "spring.main.keep-alive"),
+                evidence);
+    }
+
+    private VirtualThreadAnalysis analyzeVirtualThreads(
+            String javaVersion,
+            String virtualThreadsProperty,
+            String keepAliveProperty,
+            RuntimeEvidence evidence) {
+        boolean enabledByProperty = "true".equalsIgnoreCase(virtualThreadsProperty);
+        boolean keepAliveConfigured = "true".equalsIgnoreCase(keepAliveProperty);
         boolean javaVersionCompatible = parseJavaVersion(javaVersion) >= 21;
         boolean scheduledWorkDetected =
                 evidence.scheduledDetected() || evidence.enableSchedulingDetected();
@@ -362,6 +485,66 @@ public class RuntimeStackAnalyzer {
                 keepAliveConfigured,
                 summary,
                 List.copyOf(evidenceLines));
+    }
+
+    private void addModuleRuntimeFindings(
+            ModuleRuntimeResult moduleResult, List<Finding> findings) {
+        List<Finding> moduleFindings = new ArrayList<>();
+        addVirtualThreadFindings(moduleResult.virtualThreads(), moduleFindings);
+        addWebStackFindings(
+                moduleResult.buildInfo().dependencies(),
+                moduleResult.configuredWebApplicationType(),
+                moduleResult.analysis().webStack(),
+                moduleResult.evidence(),
+                moduleFindings);
+        addJavaVersionFindings(
+                moduleResult.analysis().springBootVersion(),
+                moduleResult.analysis().javaVersion(),
+                moduleResult.virtualThreads().enabledByProperty(),
+                moduleFindings);
+        moduleFindings.stream()
+                .map(finding -> scopeRuntimeFinding(finding, moduleResult))
+                .forEach(findings::add);
+    }
+
+    private Finding scopeRuntimeFinding(Finding finding, ModuleRuntimeResult moduleResult) {
+        String modulePath = moduleResult.analysis().modulePath();
+        String moduleEvidence =
+                moduleResult.evidence().evidence().isEmpty()
+                        ? ""
+                        : " Module source evidence: "
+                                + String.join("; ", moduleResult.evidence().evidence())
+                                + ".";
+        String evidence =
+                "Module "
+                        + modulePath
+                        + ": "
+                        + (finding.evidence() == null
+                                ? "runtime metadata matched."
+                                : finding.evidence())
+                        + moduleEvidence;
+        String sourcePath = moduleResult.sourcePath();
+        return new Finding(
+                finding.severity(),
+                finding.message(),
+                sourcePath == null ? "Runtime stack: " + modulePath : sourcePath,
+                finding.ruleId(),
+                finding.title(),
+                finding.category(),
+                finding.runtimeDetection(),
+                finding.confidence(),
+                finding.whyBadPractice(),
+                finding.possibleImpact(),
+                finding.recommendation(),
+                evidence,
+                finding.limitations(),
+                sourcePath,
+                finding.line(),
+                finding.target(),
+                finding.primaryLocation(),
+                finding.highlightRanges(),
+                finding.occurrences(),
+                finding.relatedSignals());
     }
 
     private void addVirtualThreadFindings(VirtualThreadAnalysis analysis, List<Finding> findings) {
@@ -633,6 +816,27 @@ public class RuntimeStackAnalyzer {
                 .orElse(null);
     }
 
+    private String configuredPropertyValue(
+            ConfigurationAnalysis configurationAnalysis,
+            String name,
+            String modulePath,
+            BuildInfo buildInfo) {
+        if (configurationAnalysis == null || configurationAnalysis.properties() == null) {
+            return null;
+        }
+        return configurationAnalysis.properties().stream()
+                .filter(property -> name.equals(property.name()))
+                .filter(
+                        property ->
+                                modulePath.equals(
+                                        BuildModuleResolver.modulePathFor(
+                                                property.sourceFile(), buildInfo)))
+                .map(ApplicationProperty::value)
+                .filter(value -> value != null && !value.isBlank())
+                .findFirst()
+                .orElse(null);
+    }
+
     private int parseJavaVersion(String javaVersionHint) {
         if (javaVersionHint == null || javaVersionHint.isBlank()) {
             return -1;
@@ -734,4 +938,12 @@ public class RuntimeStackAnalyzer {
             boolean webFluxRoutingDetected,
             boolean controllerDetected,
             List<String> evidence) {}
+
+    private record ModuleRuntimeResult(
+            ModuleRuntimeStackAnalysis analysis,
+            BuildInfo buildInfo,
+            String configuredWebApplicationType,
+            RuntimeEvidence evidence,
+            VirtualThreadAnalysis virtualThreads,
+            String sourcePath) {}
 }

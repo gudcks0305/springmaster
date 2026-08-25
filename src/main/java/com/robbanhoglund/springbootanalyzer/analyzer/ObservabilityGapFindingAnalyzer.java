@@ -66,7 +66,7 @@ public class ObservabilityGapFindingAnalyzer {
     public List<Finding> analyze(JavaSources sources, BuildInfo buildInfo) {
         List<Finding> findings = new ArrayList<>();
         boolean observabilityStackPresent = hasObservabilityStack(buildInfo);
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() != null) {
                 analyzeSourceFile(
                         file.compilationUnit(),

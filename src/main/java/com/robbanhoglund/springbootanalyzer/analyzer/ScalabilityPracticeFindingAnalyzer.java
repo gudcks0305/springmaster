@@ -120,7 +120,7 @@ public class ScalabilityPracticeFindingAnalyzer {
         Set<String> requiresNewMethods = collectRequiresNewMethods(sources);
 
         // Pass 2: per-file analysis
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() == null) {
                 continue;
             }
@@ -159,7 +159,7 @@ public class ScalabilityPracticeFindingAnalyzer {
         Set<String> basePackages = new LinkedHashSet<>();
         boolean defaultPackageApplication = false;
         boolean customComponentScan = false;
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             CompilationUnit cu = file.compilationUnit();
             if (cu == null) {
                 continue;
@@ -211,7 +211,7 @@ public class ScalabilityPracticeFindingAnalyzer {
 
         for (String basePackage : effectiveBasePackages) {
             Map<String, List<BeanOccurrence>> bySimpleName = new LinkedHashMap<>();
-            for (JavaSources.JavaFile file : sources.files()) {
+            for (JavaSources.JavaFile file : sources.primaryFiles()) {
                 CompilationUnit cu = file.compilationUnit();
                 if (cu == null) {
                     continue;
@@ -319,7 +319,7 @@ public class ScalabilityPracticeFindingAnalyzer {
 
     private Set<String> collectRequiresNewMethods(JavaSources sources) {
         Set<String> methods = new HashSet<>();
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             CompilationUnit cu = file.compilationUnit();
             if (cu == null) {
                 continue;
@@ -346,7 +346,7 @@ public class ScalabilityPracticeFindingAnalyzer {
 
     private Set<String> collectPrototypeTypes(JavaSources sources) {
         Set<String> prototypeTypes = new HashSet<>();
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             CompilationUnit cu = file.compilationUnit();
             if (cu == null) {
                 continue;

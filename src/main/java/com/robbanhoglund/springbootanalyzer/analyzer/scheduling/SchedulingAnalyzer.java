@@ -30,7 +30,7 @@ public class SchedulingAnalyzer {
         AtomicBoolean enableScheduling = new AtomicBoolean(false);
         AtomicBoolean enableAsync = new AtomicBoolean(false);
 
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() == null) {
                 continue;
             }

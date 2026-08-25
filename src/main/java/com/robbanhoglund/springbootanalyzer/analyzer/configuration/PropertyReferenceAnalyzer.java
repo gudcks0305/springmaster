@@ -1,7 +1,5 @@
 package com.robbanhoglund.springbootanalyzer.analyzer.configuration;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.expr.AnnotationExpr;
@@ -11,96 +9,66 @@ import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.PropertyReference;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import com.robbanhoglund.springbootanalyzer.analyzer.source.JavaSources;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Stream;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class PropertyReferenceAnalyzer {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(PropertyReferenceAnalyzer.class);
-
     private static final Pattern VALUE_PATTERN = Pattern.compile("\\$\\{([^}:]+)(?::([^}]*))?}");
-    private final JavaParser javaParser;
     private final PropertyNameNormalizer propertyNameNormalizer;
 
     public PropertyReferenceAnalyzer(PropertyNameNormalizer propertyNameNormalizer) {
         this.propertyNameNormalizer = propertyNameNormalizer;
-        this.javaParser =
-                new JavaParser(
-                        new ParserConfiguration()
-                                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25)
-                                .setCharacterEncoding(StandardCharsets.UTF_8));
     }
 
     public List<PropertyReference> analyze(Path repositoryRoot) {
-        Path sourceRoot = repositoryRoot.resolve("src/main/java");
-        if (Files.notExists(sourceRoot)) {
-            return List.of();
-        }
+        return analyze(JavaSources.from(repositoryRoot));
+    }
 
+    public List<PropertyReference> analyze(JavaSources javaSources) {
         List<PropertyReference> references = new ArrayList<>();
-        try (Stream<Path> files = Files.walk(sourceRoot)) {
-            files.filter(Files::isRegularFile)
-                    .filter(path -> path.toString().endsWith(".java"))
-                    .sorted(Comparator.naturalOrder())
-                    .forEach(path -> analyzeSourceFile(repositoryRoot, path, references));
-        } catch (IOException exception) {
-            LOGGER.warn(
-                    "Failed to fully scan property references under {}; returning partial results",
-                    sourceRoot,
-                    exception);
+        for (JavaSources.JavaFile sourceFile : javaSources.primaryFiles()) {
+            if (sourceFile.compilationUnit() == null) {
+                continue;
+            }
+            analyzeSourceFile(javaSources.repositoryRoot(), sourceFile, references);
         }
         return List.copyOf(references);
     }
 
     private void analyzeSourceFile(
-            Path repositoryRoot, Path sourceFile, List<PropertyReference> references) {
-        try {
-            var parseResult = javaParser.parse(sourceFile);
-            if (!parseResult.isSuccessful() || parseResult.getResult().isEmpty()) {
-                return;
+            Path repositoryRoot,
+            JavaSources.JavaFile sourceFile,
+            List<PropertyReference> references) {
+        CompilationUnit compilationUnit = sourceFile.compilationUnit();
+        String packageName =
+                compilationUnit
+                        .getPackageDeclaration()
+                        .map(declaration -> declaration.getNameAsString())
+                        .orElse("");
+
+        for (TypeDeclaration<?> typeDeclaration : compilationUnit.findAll(TypeDeclaration.class)) {
+            String className =
+                    packageName.isBlank()
+                            ? typeDeclaration.getNameAsString()
+                            : packageName + "." + typeDeclaration.getNameAsString();
+
+            for (AnnotationExpr annotation : typeDeclaration.findAll(AnnotationExpr.class)) {
+                collectAnnotationReference(repositoryRoot, sourceFile.path(), className, annotation)
+                        .ifPresent(references::addAll);
             }
 
-            CompilationUnit compilationUnit = parseResult.getResult().orElseThrow();
-            String packageName =
-                    compilationUnit
-                            .getPackageDeclaration()
-                            .map(declaration -> declaration.getNameAsString())
-                            .orElse("");
-
-            for (TypeDeclaration<?> typeDeclaration :
-                    compilationUnit.findAll(TypeDeclaration.class)) {
-                String className =
-                        packageName.isBlank()
-                                ? typeDeclaration.getNameAsString()
-                                : packageName + "." + typeDeclaration.getNameAsString();
-
-                for (AnnotationExpr annotation : typeDeclaration.findAll(AnnotationExpr.class)) {
-                    collectAnnotationReference(repositoryRoot, sourceFile, className, annotation)
-                            .ifPresent(references::addAll);
-                }
-
-                for (MethodCallExpr methodCallExpr :
-                        typeDeclaration.findAll(MethodCallExpr.class)) {
-                    collectMethodReference(repositoryRoot, sourceFile, className, methodCallExpr)
-                            .ifPresent(references::add);
-                }
+            for (MethodCallExpr methodCallExpr : typeDeclaration.findAll(MethodCallExpr.class)) {
+                collectMethodReference(repositoryRoot, sourceFile.path(), className, methodCallExpr)
+                        .ifPresent(references::add);
             }
-        } catch (IOException exception) {
-            // Skip an individual unreadable file rather than aborting the scan.
-            LOGGER.debug("Failed to read source file {}; skipping", sourceFile, exception);
         }
     }
 

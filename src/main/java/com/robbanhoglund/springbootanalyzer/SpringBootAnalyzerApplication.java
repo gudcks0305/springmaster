@@ -13,23 +13,23 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
  * <p>{@code @EnableConfigurationProperties} binds {@link AnalyzerProperties} from the
  * {@code analyzer.*} namespace.
  *
- * <p>When {@code --repo} is present in the command-line arguments the application starts
- * in CLI mode: the embedded web server is disabled, the {@code cli} Spring profile is
- * activated, and {@link com.robbanhoglund.springbootanalyzer.cli.CliRunner} drives
- * execution. In all other cases the application behaves as a normal Spring Boot web
- * service.
+ * <p>When {@code --worker} is present, the application starts in long-lived JSONL worker mode.
+ * When {@code --repo} is present, it starts in single-run CLI mode. Both modes disable the
+ * embedded web server and activate their respective Spring profiles. In all other cases the
+ * application behaves as a normal Spring Boot web service.
  */
 @SpringBootApplication
 @EnableConfigurationProperties(AnalyzerProperties.class)
 public class SpringBootAnalyzerApplication {
 
     public static void main(String[] args) {
+        boolean workerMode = Arrays.stream(args).anyMatch("--worker"::equals);
         boolean cliMode =
                 Arrays.stream(args).anyMatch(a -> a.startsWith("--repo=") || a.equals("--repo"));
-        if (cliMode) {
+        if (workerMode || cliMode) {
             SpringApplication app = new SpringApplication(SpringBootAnalyzerApplication.class);
             app.setWebApplicationType(WebApplicationType.NONE);
-            app.setAdditionalProfiles("cli");
+            app.setAdditionalProfiles(workerMode ? "worker" : "cli");
             app.run(args);
         } else {
             SpringApplication.run(SpringBootAnalyzerApplication.class, args);

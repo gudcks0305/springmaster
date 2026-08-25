@@ -131,7 +131,7 @@ public class SecurityPracticeFindingAnalyzer {
         String usageRelativePath = null;
         Integer usageLine = null;
         String usageTarget = null;
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             CompilationUnit cu = file.compilationUnit();
             if (cu == null) {
                 continue;

@@ -3,6 +3,7 @@ package com.robbanhoglund.springbootanalyzer.analyzer;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.robbanhoglund.springbootanalyzer.analyzer.model.SpringComponentType;
+import com.robbanhoglund.springbootanalyzer.analyzer.source.JavaSources;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -42,7 +43,7 @@ class JavaSourceAnalyzerTest {
                 }
                 """);
 
-        var result = analyzer.analyze(tempDir);
+        var result = analyzer.analyze(JavaSources.from(tempDir));
 
         assertThat(result.detectedClasses()).hasSize(2);
         assertThat(result.detectedClasses())

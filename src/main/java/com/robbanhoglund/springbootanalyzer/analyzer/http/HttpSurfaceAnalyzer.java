@@ -1,7 +1,5 @@
 package com.robbanhoglund.springbootanalyzer.analyzer.http;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
@@ -13,6 +11,7 @@ import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.BuildInfo;
+import com.robbanhoglund.springbootanalyzer.analyzer.model.BuildModuleResolver;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.Finding;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.FindingConfidence;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.FindingFactory;
@@ -30,16 +29,16 @@ import com.robbanhoglund.springbootanalyzer.analyzer.model.http.HttpSurfaceSumma
 import com.robbanhoglund.springbootanalyzer.analyzer.model.http.InboundEndpoint;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.http.OutboundEndpoint;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.http.UrlKind;
+import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.ModuleRuntimeStackAnalysis;
+import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.RuntimeStackAnalysis;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.WebStack;
-import java.io.IOException;
+import com.robbanhoglund.springbootanalyzer.analyzer.source.JavaSources;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -50,14 +49,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class HttpSurfaceAnalyzer {
-
-    private static final Logger LOGGER = LoggerFactory.getLogger(HttpSurfaceAnalyzer.class);
 
     private static final Pattern PLACEHOLDER_PATTERN =
             Pattern.compile("\\$\\{([^}:]+)(?::[^}]*)?}");
@@ -88,26 +83,47 @@ public class HttpSurfaceAnalyzer {
                     "PatchMapping",
                     "DeleteMapping");
 
-    private final JavaParser javaParser;
-
-    public HttpSurfaceAnalyzer() {
-        this.javaParser =
-                new JavaParser(
-                        new ParserConfiguration()
-                                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25)
-                                .setCharacterEncoding(StandardCharsets.UTF_8));
-    }
-
     public Result analyze(
             Path repositoryRoot,
             ConfigurationAnalysis configurationAnalysis,
             BuildInfo buildInfo,
             WebStack webStack) {
+        return analyze(
+                JavaSources.from(repositoryRoot), configurationAnalysis, buildInfo, webStack);
+    }
+
+    public Result analyze(
+            JavaSources javaSources,
+            ConfigurationAnalysis configurationAnalysis,
+            BuildInfo buildInfo,
+            WebStack webStack) {
+        return analyzeInternal(javaSources, configurationAnalysis, buildInfo, webStack, List.of());
+    }
+
+    public Result analyze(
+            JavaSources javaSources,
+            ConfigurationAnalysis configurationAnalysis,
+            BuildInfo buildInfo,
+            RuntimeStackAnalysis runtimeStackAnalysis) {
+        return analyzeInternal(
+                javaSources,
+                configurationAnalysis,
+                buildInfo,
+                runtimeStackAnalysis.webStack(),
+                runtimeStackAnalysis.modules());
+    }
+
+    private Result analyzeInternal(
+            JavaSources javaSources,
+            ConfigurationAnalysis configurationAnalysis,
+            BuildInfo buildInfo,
+            WebStack webStack,
+            List<ModuleRuntimeStackAnalysis> moduleRuntimeStacks) {
         BaseUrlCatalog baseUrlCatalog = new BaseUrlCatalog(configurationAnalysis);
         List<ConfiguredUrl> configuredUrls = detectConfiguredUrls(configurationAnalysis);
         List<ActuatorEndpointExposure> actuatorExposures =
                 detectActuatorExposures(configurationAnalysis);
-        SourceSurface sourceSurface = scanJavaSources(repositoryRoot, baseUrlCatalog);
+        SourceSurface sourceSurface = scanJavaSources(javaSources, baseUrlCatalog);
 
         HttpSurfaceSummary summary =
                 new HttpSurfaceSummary(
@@ -134,6 +150,7 @@ public class HttpSurfaceAnalyzer {
         addHttpFindings(
                 buildInfo,
                 webStack,
+                moduleRuntimeStacks,
                 sourceSurface.inboundEndpoints(),
                 configuredUrls,
                 actuatorExposures,
@@ -221,81 +238,54 @@ public class HttpSurfaceAnalyzer {
         return List.copyOf(exposures);
     }
 
-    private SourceSurface scanJavaSources(Path repositoryRoot, BaseUrlCatalog baseUrlCatalog) {
-        Path sourceRoot = repositoryRoot.resolve("src/main/java");
-        if (Files.notExists(sourceRoot)) {
-            return new SourceSurface(List.of(), List.of());
-        }
-
+    private SourceSurface scanJavaSources(JavaSources javaSources, BaseUrlCatalog baseUrlCatalog) {
         List<InboundEndpoint> inboundEndpoints = new ArrayList<>();
         List<OutboundEndpoint> outboundEndpoints = new ArrayList<>();
 
-        try (Stream<Path> files = Files.walk(sourceRoot)) {
-            for (Path file :
-                    files.filter(Files::isRegularFile)
-                            .filter(path -> path.toString().endsWith(".java"))
-                            .sorted(Comparator.naturalOrder())
-                            .toList()) {
-                parseSourceFile(
-                        repositoryRoot, file, inboundEndpoints, outboundEndpoints, baseUrlCatalog);
+        for (JavaSources.JavaFile sourceFile : javaSources.primaryFiles()) {
+            if (sourceFile.compilationUnit() == null) {
+                continue;
             }
-        } catch (IOException exception) {
-            LOGGER.warn(
-                    "Failed to fully scan Java sources for HTTP surface analysis;"
-                            + " returning partial results",
-                    exception);
+            parseSourceFile(sourceFile, inboundEndpoints, outboundEndpoints, baseUrlCatalog);
         }
         return new SourceSurface(List.copyOf(inboundEndpoints), List.copyOf(outboundEndpoints));
     }
 
     private void parseSourceFile(
-            Path repositoryRoot,
-            Path sourceFile,
+            JavaSources.JavaFile sourceFile,
             List<InboundEndpoint> inboundEndpoints,
             List<OutboundEndpoint> outboundEndpoints,
             BaseUrlCatalog baseUrlCatalog) {
-        try {
-            var parseResult = javaParser.parse(sourceFile);
-            if (!parseResult.isSuccessful() || parseResult.getResult().isEmpty()) {
-                return;
-            }
-            CompilationUnit compilationUnit = parseResult.getResult().orElseThrow();
-            String packageName =
-                    compilationUnit
-                            .getPackageDeclaration()
-                            .map(declaration -> declaration.getNameAsString())
-                            .orElse("");
-            String relativePath =
-                    repositoryRoot.relativize(sourceFile).toString().replace('\\', '/');
+        CompilationUnit compilationUnit = sourceFile.compilationUnit();
+        String packageName =
+                compilationUnit
+                        .getPackageDeclaration()
+                        .map(declaration -> declaration.getNameAsString())
+                        .orElse("");
+        String relativePath = sourceFile.relativePath();
 
-            Map<String, String> valueFieldIndex = buildValueFieldIndex(compilationUnit);
+        Map<String, String> valueFieldIndex = buildValueFieldIndex(compilationUnit);
 
-            for (ClassOrInterfaceDeclaration type :
-                    compilationUnit.findAll(ClassOrInterfaceDeclaration.class)) {
-                String className =
-                        packageName.isBlank()
-                                ? type.getNameAsString()
-                                : packageName + "." + type.getNameAsString();
-                collectInboundEndpoints(type, className, relativePath, inboundEndpoints);
-                collectFeignEndpoints(
-                        type, className, relativePath, outboundEndpoints, baseUrlCatalog);
-            }
+        for (ClassOrInterfaceDeclaration type :
+                compilationUnit.findAll(ClassOrInterfaceDeclaration.class)) {
+            String className =
+                    packageName.isBlank()
+                            ? type.getNameAsString()
+                            : packageName + "." + type.getNameAsString();
+            collectInboundEndpoints(type, className, relativePath, inboundEndpoints);
+            collectFeignEndpoints(type, className, relativePath, outboundEndpoints, baseUrlCatalog);
+        }
 
-            for (MethodCallExpr callExpr : compilationUnit.findAll(MethodCallExpr.class)) {
-                collectOutboundEndpoint(callExpr, relativePath, baseUrlCatalog, valueFieldIndex)
-                        .ifPresent(outboundEndpoints::add);
-                collectFunctionalRoute(callExpr, relativePath, packageName)
-                        .ifPresent(inboundEndpoints::add);
-            }
+        for (MethodCallExpr callExpr : compilationUnit.findAll(MethodCallExpr.class)) {
+            collectOutboundEndpoint(callExpr, relativePath, baseUrlCatalog, valueFieldIndex)
+                    .ifPresent(outboundEndpoints::add);
+            collectFunctionalRoute(callExpr, relativePath, packageName)
+                    .ifPresent(inboundEndpoints::add);
+        }
 
-            for (ObjectCreationExpr newExpr : compilationUnit.findAll(ObjectCreationExpr.class)) {
-                collectSocketEndpoint(newExpr, relativePath, valueFieldIndex)
-                        .ifPresent(outboundEndpoints::add);
-            }
-        } catch (IOException exception) {
-            // Skip an individual unreadable file rather than aborting HTTP surface analysis.
-            LOGGER.debug(
-                    "Failed to read {} for HTTP surface analysis; skipping", sourceFile, exception);
+        for (ObjectCreationExpr newExpr : compilationUnit.findAll(ObjectCreationExpr.class)) {
+            collectSocketEndpoint(newExpr, relativePath, valueFieldIndex)
+                    .ifPresent(outboundEndpoints::add);
         }
     }
 
@@ -783,13 +773,10 @@ public class HttpSurfaceAnalyzer {
                         : (baseUrlMatch == null ? null : baseUrlMatch.propertyName()));
     }
 
-    private void addHttpFindings(
-            BuildInfo buildInfo,
-            WebStack webStack,
+    private void addModuleHttpRuntimeFindings(
             List<InboundEndpoint> inboundEndpoints,
-            List<ConfiguredUrl> configuredUrls,
-            List<ActuatorEndpointExposure> actuatorExposures,
-            List<OutboundEndpoint> outboundEndpoints,
+            WebStack webStack,
+            String modulePath,
             List<Finding> findings) {
         if (!inboundEndpoints.isEmpty()
                 && (webStack == WebStack.NON_WEB || webStack == WebStack.UNKNOWN)) {
@@ -798,8 +785,9 @@ public class HttpSurfaceAnalyzer {
                                     FindingRules.SPRING_INBOUND_ENDPOINTS_IN_NON_WEB_APP,
                                     FindingConfidence.MEDIUM)
                             .shortMessage(
-                                    "Inbound HTTP endpoints were detected in code, but the runtime"
-                                            + " stack does not look like a web application.")
+                                    "Inbound HTTP endpoints were detected in code, but module "
+                                            + modulePath
+                                            + " does not look like a web application.")
                             .whyBadPractice(
                                     "Controller mappings are only served when a web application"
                                             + " context starts. Without a web starter — or with"
@@ -811,18 +799,20 @@ public class HttpSurfaceAnalyzer {
                                             + " server is listening; callers see connection"
                                             + " failures rather than HTTP errors.")
                             .recommendation(
-                                    "Add spring-boot-starter-web (or webflux) if the endpoints are"
-                                        + " meant to be served, or remove the controllers if the"
-                                        + " application is intentionally non-web.")
+                                    "Add spring-boot-starter-web (or webflux) to this module if the"
+                                            + " endpoints are meant to be served, or remove the"
+                                            + " controllers if it is intentionally non-web.")
                             .evidence(
                                     inboundEndpoints.size()
-                                            + " inbound endpoints were detected while the resolved"
-                                            + " web stack is "
+                                            + " inbound endpoints were detected in module "
+                                            + modulePath
+                                            + " while its resolved web stack is "
                                             + webStack
                                             + ".")
                             .limitations(
-                                    "The web stack is inferred from dependencies and configuration;"
-                                        + " a custom server setup may still serve the endpoints.")
+                                    "The module web stack is inferred from static dependencies and"
+                                            + " module-owned configuration; a custom server setup"
+                                            + " may still serve the endpoints.")
                             .location(inboundEndpoints.get(0).sourceFile())
                             .target("inbound HTTP endpoints")
                             .build());
@@ -837,29 +827,65 @@ public class HttpSurfaceAnalyzer {
                                     FindingRules.SPRING_WEB_STACK_WITHOUT_ENDPOINTS,
                                     FindingConfidence.MEDIUM)
                             .shortMessage(
-                                    "A web runtime stack was detected, but no inbound HTTP"
+                                    "Module "
+                                            + modulePath
+                                            + " has a web runtime stack but no inbound HTTP"
                                             + " endpoints were found.")
                             .whyBadPractice(
                                     "The application starts an embedded web server and holds the"
-                                        + " port, but exposes no application endpoints of its own.")
+                                            + " port, but exposes no application endpoints of its"
+                                            + " own.")
                             .possibleImpact(
                                     "Wasted memory and an open port with only framework/actuator"
                                             + " endpoints reachable. In a non-web service this is"
                                             + " usually an unintended dependency.")
                             .recommendation(
-                                    "Remove the web starter if the application does not serve HTTP,"
-                                            + " or set spring.main.web-application-type=none.")
+                                    "Remove the web starter if the module does not serve HTTP, or"
+                                            + " set spring.main.web-application-type=none.")
                             .evidence(
-                                    "Resolved web stack "
+                                    "Resolved module "
+                                            + modulePath
+                                            + " web stack "
                                             + webStack
-                                            + " with no @RequestMapping"
-                                            + "-style inbound endpoints detected.")
+                                            + " with no @RequestMapping-style inbound endpoints"
+                                            + " detected.")
                             .limitations(
                                     "Endpoints registered programmatically (RouterFunction beans,"
                                             + " servlet registrations) may not be detected.")
                             .target("HTTP surface")
-                            .location("HTTP surface")
+                            .location("HTTP surface: " + modulePath)
                             .build());
+        }
+    }
+
+    private void addHttpFindings(
+            BuildInfo buildInfo,
+            WebStack webStack,
+            List<ModuleRuntimeStackAnalysis> moduleRuntimeStacks,
+            List<InboundEndpoint> inboundEndpoints,
+            List<ConfiguredUrl> configuredUrls,
+            List<ActuatorEndpointExposure> actuatorExposures,
+            List<OutboundEndpoint> outboundEndpoints,
+            List<Finding> findings) {
+        if (moduleRuntimeStacks == null || moduleRuntimeStacks.isEmpty()) {
+            addModuleHttpRuntimeFindings(inboundEndpoints, webStack, "repository", findings);
+        } else {
+            Map<String, List<InboundEndpoint>> inboundByModule =
+                    inboundEndpoints.stream()
+                            .collect(
+                                    Collectors.groupingBy(
+                                            endpoint ->
+                                                    BuildModuleResolver.modulePathFor(
+                                                            endpoint.sourceFile(), buildInfo),
+                                            LinkedHashMap::new,
+                                            Collectors.toList()));
+            for (ModuleRuntimeStackAnalysis moduleRuntime : moduleRuntimeStacks) {
+                addModuleHttpRuntimeFindings(
+                        inboundByModule.getOrDefault(moduleRuntime.modulePath(), List.of()),
+                        moduleRuntime.webStack(),
+                        moduleRuntime.modulePath(),
+                        findings);
+            }
         }
 
         // Note: the MVC+WebFlux mix is reported once by RuntimeStackAnalyzer as

@@ -7,6 +7,7 @@ import com.robbanhoglund.springbootanalyzer.analyzer.http.HttpSurfaceAnalyzer;
 import com.robbanhoglund.springbootanalyzer.analyzer.messaging.MessagingAnalyzer;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.AnalysisResult;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.BuildInfo;
+import com.robbanhoglund.springbootanalyzer.analyzer.model.BuildModuleResolver;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.DetectedClass;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.Finding;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.FindingConfidence;
@@ -20,8 +21,10 @@ import com.robbanhoglund.springbootanalyzer.config.AnalyzerProperties;
 import com.robbanhoglund.springbootanalyzer.git.GitRepositoryReference;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.springframework.stereotype.Component;
 
@@ -160,9 +163,9 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
         // Parse the Java source tree once and share it across the finding analyzers below, instead
         // of each analyzer walking and re-parsing src/main/java independently.
         JavaSources javaSources = JavaSources.from(repositoryRoot);
-        SourceAnalysis sourceAnalysis = javaSourceAnalyzer.analyze(repositoryRoot);
+        SourceAnalysis sourceAnalysis = javaSourceAnalyzer.analyze(javaSources);
         ConfigurationAnalyzer.Result configurationResult =
-                configurationAnalyzer.analyze(repositoryRoot, buildInfo);
+                configurationAnalyzer.analyze(repositoryRoot, buildInfo, javaSources);
         GradleModelAnalyzer.Result gradleResult =
                 gradleModelAnalyzer.analyze(
                         repositoryReference, repositoryRoot, buildInfo, analyzerProperties);
@@ -181,10 +184,11 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
                         .map(detectedClass -> detectedClass.fullyQualifiedClassName())
                         .toList();
 
-        addApplicationStructureFindings(detectedClasses, mainApplicationClasses, findings);
+        addApplicationStructureFindings(
+                detectedClasses, mainApplicationClasses, buildInfo, findings);
         RuntimeStackAnalyzer.Result runtimeResult =
                 runtimeStackAnalyzer.analyze(
-                        repositoryRoot,
+                        javaSources,
                         buildInfo,
                         gradleResult.gradleModelAnalysis(),
                         configurationResult.configurationAnalysis(),
@@ -194,14 +198,14 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
 
         HttpSurfaceAnalyzer.Result httpResult =
                 httpSurfaceAnalyzer.analyze(
-                        repositoryRoot,
+                        javaSources,
                         configurationResult.configurationAnalysis(),
                         buildInfo,
-                        runtimeResult.runtimeStackAnalysis().webStack());
+                        runtimeResult.runtimeStackAnalysis());
         findings.addAll(httpResult.findings());
         findings.addAll(
                 staticPracticeFindingAnalyzer.analyze(
-                        repositoryRoot,
+                        javaSources,
                         buildInfo,
                         configurationResult.configurationAnalysis(),
                         gradleResult.gradleModelAnalysis(),
@@ -251,6 +255,7 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
     private void addApplicationStructureFindings(
             List<DetectedClass> detectedClasses,
             List<String> mainApplicationClasses,
+            BuildInfo buildInfo,
             List<Finding> findings) {
         if (mainApplicationClasses.isEmpty()) {
             findings.add(
@@ -260,7 +265,7 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
                             .shortMessage(
                                     "No @SpringBootApplication class was found. The project may not"
                                         + " be a Spring Boot application or the main class may be"
-                                        + " outside src/main/java.")
+                                        + " outside a standard src/main/java source tree.")
                             .whyBadPractice(
                                     "The @SpringBootApplication class defines the component scan"
                                         + " root that most of this analysis depends on. Without it,"
@@ -271,21 +276,39 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
                                             + " report is less complete than it appears.")
                             .recommendation(
                                     "If this is a Spring Boot application, confirm the entry point"
-                                        + " lives under src/main/java. For a library module this"
-                                        + " finding is expected and can be suppressed.")
+                                        + " lives under a standard src/main/java tree in this"
+                                        + " repository. For a library-only repository this finding"
+                                        + " is expected and can be suppressed.")
                             .evidence(
-                                    "No class annotated @SpringBootApplication was found under"
-                                            + " src/main/java.")
+                                    "No class annotated @SpringBootApplication was found in any"
+                                            + " nested src/main/java tree.")
                             .limitations(
-                                    "Multi-module builds may declare the entry point in another"
-                                            + " module that is not part of this analysis.")
+                                    "Custom source sets and generated sources outside standard"
+                                            + " src/main/java trees are not part of this analysis.")
                             .target("application entry point")
                             .location("Application structure")
                             .build());
             return;
         }
 
-        if (mainApplicationClasses.size() > 1) {
+        Map<String, List<DetectedClass>> mainApplicationsByModule = new LinkedHashMap<>();
+        for (DetectedClass detectedClass : detectedClasses) {
+            if (detectedClass.componentType() != SpringComponentType.MAIN_APPLICATION) {
+                continue;
+            }
+            mainApplicationsByModule
+                    .computeIfAbsent(
+                            BuildModuleResolver.modulePathFor(detectedClass.filePath(), buildInfo),
+                            ignored -> new ArrayList<>())
+                    .add(detectedClass);
+        }
+
+        for (Map.Entry<String, List<DetectedClass>> entry : mainApplicationsByModule.entrySet()) {
+            List<String> moduleMainApplications =
+                    entry.getValue().stream().map(DetectedClass::fullyQualifiedClassName).toList();
+            if (moduleMainApplications.size() <= 1) {
+                continue;
+            }
             findings.add(
                     FindingFactory.builder(
                                     FindingRules.SPRING_MULTIPLE_MAIN_APPLICATION_CLASSES,
@@ -308,21 +331,18 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
                                             + " application. Use plain @Configuration classes for"
                                             + " test-only or auxiliary contexts.")
                             .evidence(
-                                    mainApplicationClasses.size()
+                                    moduleMainApplications.size()
                                             + " @SpringBootApplication classes were detected: "
-                                            + String.join(", ", mainApplicationClasses)
+                                            + String.join(", ", moduleMainApplications)
                                             + ".")
+                            .limitations(
+                                    "This check is scoped to build module "
+                                            + entry.getKey()
+                                            + "; separate deployable modules may each define one"
+                                            + " application entry point.")
                             .target("application entry points")
-                            .location("Application structure")
+                            .location("Application structure: " + entry.getKey())
                             .build());
-        }
-
-        Set<String> mainPackages = new LinkedHashSet<>();
-        for (String mainApplicationClass : mainApplicationClasses) {
-            int separatorIndex = mainApplicationClass.lastIndexOf('.');
-            if (separatorIndex > 0) {
-                mainPackages.add(mainApplicationClass.substring(0, separatorIndex));
-            }
         }
 
         for (DetectedClass detectedClass : detectedClasses) {
@@ -332,11 +352,30 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
             if (detectedClass.packageName() == null || detectedClass.packageName().isBlank()) {
                 continue;
             }
+            String modulePath =
+                    BuildModuleResolver.modulePathFor(detectedClass.filePath(), buildInfo);
+            List<DetectedClass> scopedMainApplications =
+                    mainApplicationsByModule.getOrDefault(modulePath, List.of());
+            if (scopedMainApplications.isEmpty()) {
+                scopedMainApplications =
+                        mainApplicationsByModule.values().stream().flatMap(List::stream).toList();
+            }
+            Set<String> mainPackages = new LinkedHashSet<>();
+            for (DetectedClass mainApplication : scopedMainApplications) {
+                String mainApplicationClass = mainApplication.fullyQualifiedClassName();
+                int separatorIndex = mainApplicationClass.lastIndexOf('.');
+                if (separatorIndex > 0) {
+                    mainPackages.add(mainApplicationClass.substring(0, separatorIndex));
+                }
+            }
             boolean underMainPackage =
                     mainPackages.stream()
                             .anyMatch(
                                     mainPackage ->
-                                            detectedClass.packageName().startsWith(mainPackage));
+                                            detectedClass.packageName().equals(mainPackage)
+                                                    || detectedClass
+                                                            .packageName()
+                                                            .startsWith(mainPackage + "."));
             if (!underMainPackage) {
                 findings.add(
                         FindingFactory.builder(
@@ -368,6 +407,8 @@ public class SpringBootProjectAnalyzer implements StaticAnalyzer {
                                         detectedClass.fullyQualifiedClassName()
                                                 + " is in package "
                                                 + detectedClass.packageName()
+                                                + " in module "
+                                                + modulePath
                                                 + ", outside the main application package(s): "
                                                 + String.join(", ", mainPackages)
                                                 + ".")

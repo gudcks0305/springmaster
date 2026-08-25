@@ -1,7 +1,5 @@
 package com.robbanhoglund.springbootanalyzer.analyzer;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.NodeList;
@@ -55,14 +53,11 @@ import com.robbanhoglund.springbootanalyzer.analyzer.model.gradle.GradleModelAna
 import com.robbanhoglund.springbootanalyzer.analyzer.model.http.HttpSurfaceAnalysis;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.http.OutboundEndpoint;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.runtime.RuntimeStackAnalysis;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import com.robbanhoglund.springbootanalyzer.analyzer.source.JavaSources;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -73,16 +68,10 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 @Component
 public class StaticPracticeFindingAnalyzer {
-
-    private static final Logger LOGGER =
-            LoggerFactory.getLogger(StaticPracticeFindingAnalyzer.class);
 
     private static final Set<String> SENSITIVE_MARKERS =
             Set.of(
@@ -219,18 +208,26 @@ public class StaticPracticeFindingAnalyzer {
         return false;
     }
 
-    private final JavaParser javaParser;
-
-    public StaticPracticeFindingAnalyzer() {
-        this.javaParser =
-                new JavaParser(
-                        new ParserConfiguration()
-                                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25)
-                                .setCharacterEncoding(StandardCharsets.UTF_8));
+    public List<Finding> analyze(
+            Path repositoryRoot,
+            BuildInfo buildInfo,
+            ConfigurationAnalysis configurationAnalysis,
+            GradleModelAnalysis gradleModelAnalysis,
+            RuntimeStackAnalysis runtimeStackAnalysis,
+            HttpSurfaceAnalysis httpSurfaceAnalysis,
+            List<DetectedClass> detectedClasses) {
+        return analyze(
+                JavaSources.from(repositoryRoot),
+                buildInfo,
+                configurationAnalysis,
+                gradleModelAnalysis,
+                runtimeStackAnalysis,
+                httpSurfaceAnalysis,
+                detectedClasses);
     }
 
     public List<Finding> analyze(
-            Path repositoryRoot,
+            JavaSources javaSources,
             BuildInfo buildInfo,
             ConfigurationAnalysis configurationAnalysis,
             GradleModelAnalysis gradleModelAnalysis,
@@ -246,7 +243,7 @@ public class StaticPracticeFindingAnalyzer {
                 bootVersion != null
                         && (bootVersion.startsWith("1.") || bootVersion.startsWith("2."));
         detectSourcePractices(
-                repositoryRoot,
+                javaSources,
                 httpSurfaceAnalysis,
                 detectedClasses,
                 legacyTransactionalVisibility,
@@ -256,15 +253,11 @@ public class StaticPracticeFindingAnalyzer {
     }
 
     private void detectSourcePractices(
-            Path repositoryRoot,
+            JavaSources javaSources,
             HttpSurfaceAnalysis httpSurfaceAnalysis,
             List<DetectedClass> detectedClasses,
             boolean legacyTransactionalVisibility,
             List<Finding> findings) {
-        Path sourceRoot = repositoryRoot.resolve("src/main/java");
-        if (Files.notExists(sourceRoot)) {
-            return;
-        }
         Map<String, List<OutboundEndpoint>> outboundByFile =
                 (httpSurfaceAnalysis == null
                                 ? List.<OutboundEndpoint>of()
@@ -288,45 +281,30 @@ public class StaticPracticeFindingAnalyzer {
                         .map(DetectedClass::fullyQualifiedClassName)
                         .collect(Collectors.toSet());
 
-        try (Stream<Path> files = Files.walk(sourceRoot)) {
-            for (Path sourceFile :
-                    files.filter(Files::isRegularFile)
-                            .filter(path -> path.toString().endsWith(".java"))
-                            .sorted(Comparator.naturalOrder())
-                            .toList()) {
-                parseSourcePractices(
-                        repositoryRoot,
-                        sourceFile,
-                        outboundByFile,
-                        controllerClasses,
-                        legacyTransactionalVisibility,
-                        findings);
+        for (JavaSources.JavaFile sourceFile : javaSources.primaryFiles()) {
+            if (sourceFile.compilationUnit() == null) {
+                continue;
             }
-        } catch (IOException exception) {
-            LOGGER.warn(
-                    "Failed to fully scan Java sources for static practice findings;"
-                            + " returning partial results",
-                    exception);
+            parseSourcePractices(
+                    sourceFile,
+                    outboundByFile,
+                    controllerClasses,
+                    legacyTransactionalVisibility,
+                    findings);
         }
-        detectAsyncWithoutExecutor(repositoryRoot, findings);
-        detectScheduledWithoutExecutor(repositoryRoot, findings);
+        detectAsyncWithoutExecutor(javaSources, findings);
+        detectScheduledWithoutExecutor(javaSources, findings);
     }
 
     private void parseSourcePractices(
-            Path repositoryRoot,
-            Path sourceFile,
+            JavaSources.JavaFile sourceFile,
             Map<String, List<OutboundEndpoint>> outboundByFile,
             Set<String> controllerClasses,
             boolean legacyTransactionalVisibility,
-            List<Finding> findings)
-            throws IOException {
-        var parseResult = javaParser.parse(sourceFile);
-        if (!parseResult.isSuccessful() || parseResult.getResult().isEmpty()) {
-            return;
-        }
-        CompilationUnit compilationUnit = parseResult.getResult().orElseThrow();
-        String relativePath = repositoryRoot.relativize(sourceFile).toString().replace('\\', '/');
-        String fileContent = Files.readString(sourceFile, StandardCharsets.UTF_8);
+            List<Finding> findings) {
+        CompilationUnit compilationUnit = sourceFile.compilationUnit();
+        String relativePath = sourceFile.relativePath();
+        String fileContent = sourceFile.content();
         for (ClassOrInterfaceDeclaration declaration :
                 compilationUnit.findAll(ClassOrInterfaceDeclaration.class)) {
             analyzeClassSourceSignals(
@@ -5789,37 +5767,24 @@ public class StaticPracticeFindingAnalyzer {
                         });
     }
 
-    private void detectAsyncWithoutExecutor(Path repositoryRoot, List<Finding> findings) {
-        Path sourceRoot = repositoryRoot.resolve("src/main/java");
-        if (Files.notExists(sourceRoot)) {
-            return;
-        }
+    private void detectAsyncWithoutExecutor(JavaSources javaSources, List<Finding> findings) {
         boolean hasAsyncAnnotation = false;
         boolean hasExecutorBean = false;
         boolean hasEnableAsync = false;
-        try (Stream<Path> files = Files.walk(sourceRoot)) {
-            for (Path file :
-                    files.filter(Files::isRegularFile)
-                            .filter(path -> path.toString().endsWith(".java"))
-                            .toList()) {
-                try {
-                    String content = Files.readString(file, StandardCharsets.UTF_8);
-                    if (content.contains("@Async")) {
-                        hasAsyncAnnotation = true;
-                    }
-                    if (content.contains("@EnableAsync")) {
-                        hasEnableAsync = true;
-                    }
-                    if (content.contains("@Bean")
-                            && (content.contains("ThreadPoolTaskExecutor")
-                                    || content.contains("AsyncTaskExecutor")
-                                    || content.contains("TaskExecutor"))) {
-                        hasExecutorBean = true;
-                    }
-                } catch (IOException ignored) {
-                }
+        for (JavaSources.JavaFile file : javaSources.primaryFiles()) {
+            String content = file.content();
+            if (content.contains("@Async")) {
+                hasAsyncAnnotation = true;
             }
-        } catch (IOException ignored) {
+            if (content.contains("@EnableAsync")) {
+                hasEnableAsync = true;
+            }
+            if (content.contains("@Bean")
+                    && (content.contains("ThreadPoolTaskExecutor")
+                            || content.contains("AsyncTaskExecutor")
+                            || content.contains("TaskExecutor"))) {
+                hasExecutorBean = true;
+            }
         }
         // Without @EnableAsync the methods run synchronously and no executor is ever used, so
         // the executor advice would be moot — SPRING_ASYNC_WITHOUT_ENABLE_ASYNC covers that case.
@@ -5861,34 +5826,21 @@ public class StaticPracticeFindingAnalyzer {
         }
     }
 
-    private void detectScheduledWithoutExecutor(Path repositoryRoot, List<Finding> findings) {
-        Path sourceRoot = repositoryRoot.resolve("src/main/java");
-        if (Files.notExists(sourceRoot)) {
-            return;
-        }
+    private void detectScheduledWithoutExecutor(JavaSources javaSources, List<Finding> findings) {
         int scheduledCount = 0;
         boolean hasTaskScheduler = false;
         boolean hasEnableScheduling = false;
-        try (Stream<Path> files = Files.walk(sourceRoot)) {
-            for (Path file :
-                    files.filter(Files::isRegularFile)
-                            .filter(path -> path.toString().endsWith(".java"))
-                            .toList()) {
-                try {
-                    String content = Files.readString(file, StandardCharsets.UTF_8);
-                    scheduledCount += countOccurrences(content, "@Scheduled");
-                    if (content.contains("@EnableScheduling")) {
-                        hasEnableScheduling = true;
-                    }
-                    if (content.contains("@Bean")
-                            && (content.contains("TaskScheduler")
-                                    || content.contains("SchedulingConfigurer"))) {
-                        hasTaskScheduler = true;
-                    }
-                } catch (IOException ignored) {
-                }
+        for (JavaSources.JavaFile file : javaSources.primaryFiles()) {
+            String content = file.content();
+            scheduledCount += countOccurrences(content, "@Scheduled");
+            if (content.contains("@EnableScheduling")) {
+                hasEnableScheduling = true;
             }
-        } catch (IOException ignored) {
+            if (content.contains("@Bean")
+                    && (content.contains("TaskScheduler")
+                            || content.contains("SchedulingConfigurer"))) {
+                hasTaskScheduler = true;
+            }
         }
         // Without @EnableScheduling no trigger is registered at all, so warning about the
         // single-threaded scheduler would be moot — SPRING_SCHEDULED_WITHOUT_ENABLE_SCHEDULING

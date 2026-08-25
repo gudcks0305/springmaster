@@ -93,7 +93,7 @@ public class CachingPracticeFindingAnalyzer {
     public List<Finding> analyze(JavaSources sources) {
         List<Finding> findings = new ArrayList<>();
         boolean cacheableFound = false;
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() != null) {
                 analyzeSourceFile(file.compilationUnit(), file.relativePath(), findings);
             }
@@ -775,7 +775,7 @@ public class CachingPracticeFindingAnalyzer {
         }
         // Also scan Java source for CacheManager bean declarations
         if (!providerConfigured) {
-            for (JavaSources.JavaFile file : sources.files()) {
+            for (JavaSources.JavaFile file : sources.primaryFiles()) {
                 for (String indicator : TTL_PROVIDER_INDICATORS) {
                     if (file.content().contains(indicator)) {
                         providerConfigured = true;

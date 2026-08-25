@@ -10,12 +10,10 @@ import com.robbanhoglund.springbootanalyzer.config.AnalyzerProperties;
 import com.robbanhoglund.springbootanalyzer.git.GitCloneService;
 import com.robbanhoglund.springbootanalyzer.git.GitHubLinkBuilder;
 import com.robbanhoglund.springbootanalyzer.git.GitRepositoryReference;
-import com.robbanhoglund.springbootanalyzer.suppression.SuppressionService;
 import com.robbanhoglund.springbootanalyzer.workspace.WorkspaceService;
 import com.robbanhoglund.springbootanalyzer.workspace.WorkspaceService.Workspace;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.env.Environment;
@@ -33,9 +31,7 @@ public class RepositoryAnalysisService {
     private final AnalyzerProperties analyzerProperties;
     private final GitHubLinkBuilder gitHubLinkBuilder;
     private final AnalysisSessionRegistry analysisSessionRegistry;
-    private final FindingNormalizer findingNormalizer;
-    private final SuppressionService suppressionService;
-    private final UserRuleConfigService userRuleConfigService;
+    private final FindingPostProcessor findingPostProcessor;
 
     /**
      * Whether to retain the workspace after analysis so the UI can fetch source snippets. Only
@@ -52,9 +48,7 @@ public class RepositoryAnalysisService {
             AnalyzerProperties analyzerProperties,
             GitHubLinkBuilder gitHubLinkBuilder,
             AnalysisSessionRegistry analysisSessionRegistry,
-            FindingNormalizer findingNormalizer,
-            SuppressionService suppressionService,
-            UserRuleConfigService userRuleConfigService,
+            FindingPostProcessor findingPostProcessor,
             Environment environment) {
         this.workspaceService = workspaceService;
         this.gitCloneService = gitCloneService;
@@ -62,9 +56,7 @@ public class RepositoryAnalysisService {
         this.analyzerProperties = analyzerProperties;
         this.gitHubLinkBuilder = gitHubLinkBuilder;
         this.analysisSessionRegistry = analysisSessionRegistry;
-        this.findingNormalizer = findingNormalizer;
-        this.suppressionService = suppressionService;
-        this.userRuleConfigService = userRuleConfigService;
+        this.findingPostProcessor = findingPostProcessor;
         this.retainWorkspaceForSnippetBrowsing = !environment.acceptsProfiles(Profiles.of("cli"));
     }
 
@@ -144,17 +136,8 @@ public class RepositoryAnalysisService {
 
     private AnalysisResult enrichAnalysisResult(
             AnalysisResult result, String analysisId, String commitSha, Path repositoryRoot) {
-        List<Finding> normalizedFindings = findingNormalizer.normalize(result.findings());
-        List<Finding> suppressedFindings =
-                suppressionService.apply(normalizedFindings, repositoryRoot);
-        Set<String> disabledRuleIds = userRuleConfigService.getDisabledRuleIds();
-        Set<String> disabledSeverities =
-                userRuleConfigService.fullyDisabledSeverities(disabledRuleIds);
         List<Finding> findings =
-                suppressedFindings.stream()
-                        .filter(
-                                finding ->
-                                        isNotDisabled(finding, disabledRuleIds, disabledSeverities))
+                findingPostProcessor.process(result.findings(), repositoryRoot).stream()
                         .map(finding -> enrichFinding(finding, result.repositoryUrl(), commitSha))
                         .toList();
         return new AnalysisResult(
@@ -173,20 +156,6 @@ public class RepositoryAnalysisService {
                 result.gradleModelAnalysis(),
                 result.schedulingAnalysis(),
                 result.messagingAnalysis());
-    }
-
-    private static boolean isNotDisabled(
-            Finding finding, Set<String> disabledRuleIds, Set<String> disabledSeverities) {
-        // Explicit rule-level disable
-        if (finding.ruleId() != null && disabledRuleIds.contains(finding.ruleId())) {
-            return false;
-        }
-        // Severity-level fallback: if all known rules of this severity are disabled,
-        // suppress even findings with unknown or null ruleIds of the same severity
-        if (finding.severity() != null && disabledSeverities.contains(finding.severity().name())) {
-            return false;
-        }
-        return true;
     }
 
     private Finding enrichFinding(Finding finding, String repositoryUrl, String commitSha) {

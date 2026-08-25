@@ -49,7 +49,7 @@ public class TransactionPracticeFindingAnalyzer {
      */
     public List<Finding> analyze(JavaSources sources) {
         List<Finding> findings = new ArrayList<>();
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() == null) {
                 continue;
             }

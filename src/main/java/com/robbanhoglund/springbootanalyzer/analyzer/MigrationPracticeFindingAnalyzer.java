@@ -87,7 +87,7 @@ public class MigrationPracticeFindingAnalyzer {
     public List<Finding> analyze(JavaSources sources, RuntimeStackAnalysis runtimeStackAnalysis) {
         List<Finding> findings = new ArrayList<>();
         boolean springBoot3Plus = isSpringBoot3Plus(runtimeStackAnalysis);
-        for (JavaSources.JavaFile file : sources.files()) {
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() == null) {
                 continue;
             }

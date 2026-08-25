@@ -1,0 +1,4 @@
+interface:
+  display_name: "Springmaster"
+  short_description: "Scan local Spring repositories for bad patterns"
+  default_prompt: "Use $springmaster to scan these local Spring repositories and summarize the findings."

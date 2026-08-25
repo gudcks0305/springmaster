@@ -99,6 +99,7 @@ See [docs/RULES.md](docs/RULES.md) for the complete rule catalog including detec
 | Component | Version |
 |-----------|---------|
 | Java | 25 |
+| Go | 1.26 |
 | Node.js | 22 |
 | Gradle | via wrapper (`./gradlew`) |
 
@@ -165,6 +166,142 @@ java -jar spring-boot-analyzer.jar \
   --quiet \
   > analysis.json
 ```
+
+## Go control plane: `springmaster`
+
+`springmaster` is a small Go coordinator around the existing Java analyzer. It
+keeps Java analyzer workers alive, assigns repository snapshots to a bounded
+worker pool, and combines JSONL responses. The Java analyzer remains the source
+of finding rules and report shape; Go owns discovery, scheduling, cache lookup,
+and process supervision.
+
+The coordinator takes an explicit **master root**. It recursively discovers
+Git repositories below that root, applies optional include/exclude/depth
+filters, and snapshots each one for a worker. It does not clone, checkout,
+reset, clean, or otherwise prepare them. A dirty worktree is valid input: the
+files on disk are the input and their content is included in the snapshot
+identity. Keep the master root dedicated to repositories and put the cache
+outside it when possible.
+
+### Install, build, and run
+
+Build the Java worker jar and Go binary from the repository checkout:
+
+```bash
+./scripts/build.sh
+```
+
+The stable local artifacts are `dist/springmaster` and `dist/analyzer.jar`.
+Git hooks are never installed by a build; install the repository hook only when
+you explicitly want it and no hook of that name already exists:
+
+```bash
+./gradlew installGitHooks
+```
+
+Run a read-only scan of a master folder. `ROOT` is a positional argument; the
+command has no implicit current-directory scan. The benchmark harness below
+requires `ROOT` to be an existing absolute directory.
+
+```bash
+./dist/springmaster scan /srv/spring-repositories \
+  --worker-command "java -jar $PWD/dist/analyzer.jar --worker" \
+  --cache-dir "$PWD/.springmaster-cache" \
+  --workers 4 \
+  --mode STATIC_ONLY
+```
+
+`STATIC_ONLY` is the default and is suitable for dirty or untrusted source
+trees. Use `EXTENDED` only after explicitly trusting every repository and its
+Gradle build logic:
+
+```bash
+./dist/springmaster scan /srv/trusted-spring-repositories \
+  --worker-command "java -jar $PWD/dist/analyzer.jar --worker" \
+  --workers 2 \
+  --mode EXTENDED \
+  --trust-extended
+```
+
+`EXTENDED` can invoke the Gradle Tooling API. Repository-controlled settings,
+init scripts, plugins, and build logic may execute during model resolution. Run
+that mode in a disposable, network-restricted sandbox when trust is not
+complete. The Go coordinator does not make `EXTENDED` safe, and master-folder
+EXTENDED scans are limited to exactly one discovered repository.
+
+### Release assets
+
+Each GitHub Release includes an archive per supported OS/architecture. Every
+archive contains the matching `springmaster` binary, `analyzer.jar`, and a
+component `SHA256SUMS`; the standalone `analyzer.jar` remains available for the
+original Java CLI. The top-level `SHA256SUMS` verifies every released asset.
+
+```bash
+# Linux
+sha256sum -c SHA256SUMS
+
+# macOS
+shasum -a 256 -c SHA256SUMS
+
+tar -xzf springmaster_vX.Y.Z_darwin_arm64.tar.gz
+./springmaster scan /absolute/master/root \
+  --worker-command "java -jar $PWD/analyzer.jar --worker"
+```
+
+### Architecture and worker boundary
+
+```text
+master root
+    │ discover repositories + compute content identity
+    ▼
+Go coordinator ── bounded jobs ──► Java worker 1 ─┐
+      │                         Java worker 2 ─┼─ JSONL result/error
+      │                         Java worker N ─┘
+      └─ cache lookup/write, ordering, exit status
+```
+
+Each Java worker is a long-lived JVM. The coordinator sends one JSON object per
+line on worker stdin and reads one response per line from stdout; diagnostics
+stay on stderr. Requests contain `schemaVersion`, `requestId`,
+`repositoryPath`, `repositoryId`, `contentHash`, and `mode`. A malformed request
+or an analyzer failure is reported for that request and does not require the
+worker to exit. See [docs/WORKER_PROTOCOL.md](docs/WORKER_PROTOCOL.md).
+
+Maven/Gradle modules with Java sources are analyzed separately. A static
+cross-repository graph orders local dependencies first and propagates dependency
+content into cache identities, while unresolved dynamic build logic is reported
+without executing the target build.
+
+Cache entries are content-addressed. The logical key is:
+
+```text
+(protocol schema version, worker command and artifact identity, repository ID,
+ dependency-aware content hash, analysis mode, rule-configuration identity)
+```
+
+The absolute repository path, worker count, wall-clock timestamp, and queue
+position are not cache inputs. A dirty change therefore produces a new key
+without changing or cleaning the worktree. Local Maven/Gradle dependencies are
+folded into an effective hash, so a dependency repository change invalidates
+its dependents. Regular files named by the worker command (including the
+analyzer JAR) are content-hashed. See [docs/MASTER_FOLDER.md](docs/MASTER_FOLDER.md) and
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+### Control-plane exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Scan completed; no finding met configured failure threshold |
+| `1` | Scan completed; at least one finding met threshold |
+| `2` | Operational failure: invalid master root at runtime, worker startup/protocol failure, or I/O error |
+| `4` | Invalid command-line arguments or configuration |
+
+An individual worker failure is included in the run result and causes the
+control plane to use an operational-failure status if the run cannot complete.
+The existing Java analyzer and its Go control plane are distributed under the
+repository's [Apache-2.0 license](LICENSE), with the Java analyzer based on the
+upstream `RobbanHoglund/spring-boot-analyzer` project. Preserve upstream license
+and attribution notices in redistributed builds.
 
 In Docker (no web server started):
 ```bash

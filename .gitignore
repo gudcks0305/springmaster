@@ -158,6 +158,10 @@ application-dev-local.yml
 *.sqlite3
 
 /debug/
+
+# Go control plane
+/springmaster
+/.springmaster/
 tmp/
 temp/
 *.tmp

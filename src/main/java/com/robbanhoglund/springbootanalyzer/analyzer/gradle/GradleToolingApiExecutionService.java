@@ -10,7 +10,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -68,8 +70,10 @@ public class GradleToolingApiExecutionService {
             Path localPluginRepository) {
         String executionLabel =
                 GradleExecutionSupport.executionModeLabel("TOOLING_API", executionMode);
+        GradleExecutionSupport.ExecutionFiles files = null;
+        GradleConnector connector = null;
         try {
-            GradleExecutionSupport.ExecutionFiles files =
+            files =
                     GradleExecutionSupport.prepareExecutionFiles(
                             repositoryRoot, properties, localPluginRepository);
             CappedOutputStream output = new CappedOutputStream(properties.maxOutputBytes());
@@ -84,7 +88,7 @@ public class GradleToolingApiExecutionService {
                     properties.timeout(),
                     executionMode == GradleExecutionMode.WRAPPER);
 
-            GradleConnector connector =
+            connector =
                     GradleConnector.newConnector()
                             .forProjectDirectory(repositoryRoot.toFile())
                             .useGradleUserHomeDir(files.gradleUserHome().toFile());
@@ -100,6 +104,9 @@ public class GradleToolingApiExecutionService {
                 launcher.setColorOutput(false);
                 launcher.setStandardOutput(output);
                 launcher.setStandardError(output);
+                launcher.setEnvironmentVariables(
+                        launcherEnvironment(System.getenv(), files, properties));
+                launcher.addJvmArguments("-Duser.home=" + files.executionHome());
                 if (properties.javaHome() != null) {
                     launcher.setJavaHome(properties.javaHome().toFile());
                 }
@@ -148,7 +155,36 @@ public class GradleToolingApiExecutionService {
                             message,
                             classifiedFailure.pluginResolutionFailure()),
                     classifiedFailure.pluginResolutionFailure());
+        } finally {
+            if (connector != null) {
+                // Cancellation is best effort. Disconnect after closing the ProjectConnection so
+                // the connector can release any remaining Tooling API resources before HOME
+                // cleanup.
+                try {
+                    connector.disconnect();
+                } catch (RuntimeException exception) {
+                    LOGGER.debug("Failed to disconnect Gradle Tooling API connector", exception);
+                }
+            }
+            GradleExecutionSupport.cleanupExecutionHome(files);
         }
+    }
+
+    Map<String, String> launcherEnvironment(
+            Map<String, String> currentEnvironment,
+            GradleExecutionSupport.ExecutionFiles files,
+            AnalyzerProperties.GradleProperties properties) {
+        Map<String, String> environment =
+                new LinkedHashMap<>(
+                        GradleExecutionSupport.safeEnvironment(
+                                currentEnvironment,
+                                files.gradleUserHome(),
+                                files.executionHome(),
+                                properties));
+        if (properties.javaHome() != null) {
+            environment.put("JAVA_HOME", properties.javaHome().toString());
+        }
+        return Map.copyOf(environment);
     }
 
     private void configureConnector(

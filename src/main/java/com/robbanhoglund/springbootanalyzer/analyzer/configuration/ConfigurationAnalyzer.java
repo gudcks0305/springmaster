@@ -19,6 +19,7 @@ import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.CustomP
 import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.PropertyDocumentation;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.PropertyKind;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.configuration.PropertyReference;
+import com.robbanhoglund.springbootanalyzer.analyzer.source.JavaSources;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -117,12 +118,16 @@ public class ConfigurationAnalyzer {
     }
 
     public Result analyze(Path repositoryRoot, BuildInfo buildInfo) {
+        return analyze(repositoryRoot, buildInfo, JavaSources.from(repositoryRoot));
+    }
+
+    public Result analyze(Path repositoryRoot, BuildInfo buildInfo, JavaSources javaSources) {
         SpringConfigurationMetadataCatalog.MetadataCatalog metadataCatalog =
                 springConfigurationMetadataCatalog.load(repositoryRoot);
         List<ConfigurationPropertiesClass> customConfigurationClasses =
-                configurationPropertiesClassAnalyzer.analyze(repositoryRoot);
+                configurationPropertiesClassAnalyzer.analyze(javaSources);
         List<PropertyReference> propertyReferences =
-                propertyReferenceAnalyzer.analyze(repositoryRoot).stream()
+                propertyReferenceAnalyzer.analyze(javaSources).stream()
                         .filter(reference -> !isIgnoredSystemPropertyReference(reference))
                         .toList();
 
