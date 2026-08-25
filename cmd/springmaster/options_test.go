@@ -35,11 +35,20 @@ func TestParseScanArgsRejectsInvalidArguments(t *testing.T) {
 		{"/repos", "--worker-command", "worker", "--unknown"},
 		{"/repos", "--worker-command", "worker", "--mode", "EXTENDED"},
 		{"/repos", "--worker-command", "worker", "--trust-extended"},
-		{"/repos"},
 	} {
 		if _, err := parseScanArgs(arguments); err == nil {
 			t.Fatalf("parseScanArgs(%q) unexpectedly succeeded", arguments)
 		}
+	}
+}
+
+func TestParseScanArgsAllowsBundledWorker(t *testing.T) {
+	options, err := parseScanArgs([]string{"/repos", "--format", "json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.workerCommand != "" {
+		t.Fatalf("workerCommand = %q, want bundled default", options.workerCommand)
 	}
 }
 

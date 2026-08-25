@@ -1,21 +1,71 @@
-# Spring Boot Analyzer
+# Springmaster
 
-[![CI](https://github.com/RobbanHoglund/spring-boot-analyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/RobbanHoglund/spring-boot-analyzer/actions/workflows/ci.yml)
+[![CI](https://github.com/gudcks0305/springmaster/actions/workflows/ci.yml/badge.svg)](https://github.com/gudcks0305/springmaster/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Java](https://img.shields.io/badge/java-25-orange.svg)](build.gradle)
 [![Spring Boot](https://img.shields.io/badge/spring--boot-3.5-brightgreen.svg)](build.gradle)
 
-A static analysis tool for Spring Boot projects. Point it at any Git repository and get a structured report of findings, component inventory, HTTP surface, configuration risks, and anti-patterns — without running the analyzed application. 199 rules across 19 categories out of the box.
+A master-folder static analyzer for Spring Boot projects. Scan many existing
+local Git repositories with one command and get structured findings, component
+inventory, HTTP surface, configuration risks, and anti-patterns without running
+the applications. The Java analyzer provides 199 rules across 19 categories;
+the Go control plane adds bounded multi-repository orchestration, dependency
+context, caching, and process supervision.
 
-**Safe by default.** The default `STATIC_ONLY` mode clones the repository into a temporary workspace and performs static analysis only. It does not run Gradle tasks, Maven goals, tests, or the analyzed Spring Boot application. See [SECURITY.md](SECURITY.md) for the full security model.
+**Safe by default.** `springmaster` snapshots local repositories without
+cleaning, checking out, or rewriting them. The default `STATIC_ONLY` mode does
+not run Gradle tasks, Maven goals, tests, scripts, or analyzed applications.
+The upstream-compatible Java web/API surface remains available for remote
+repository cloning. See [SECURITY.md](SECURITY.md) and
+[docs/MASTER_FOLDER.md](docs/MASTER_FOLDER.md).
 
 ![Spring Boot Analyzer](docs/screenshot.png)
 
 ---
 
+## Quick start: local master folder
+
+```bash
+# Build the paired Go binary + Java analyzer JAR.
+./scripts/build.sh
+
+# Install both as one user-local package.
+./scripts/install-cli.sh
+
+# No JAR path or worker command required.
+springmaster scan /absolute/path/to/spring-repositories \
+  --mode STATIC_ONLY \
+  --workers 2 \
+  --format json \
+  --fail-on none
+```
+
+Installed layout:
+
+```text
+~/.local/bin/springmaster -> ~/.local/share/springmaster/springmaster
+~/.local/share/springmaster/analyzer.jar
+```
+
+`XDG_DATA_HOME` and `SPRINGMASTER_BIN_DIR` can override the two user-local
+roots. The command resolves the paired JAR automatically; use
+`SPRINGMASTER_ANALYZER_JAR` or `--worker-command` only for explicit overrides.
+
+---
+
 ## What it does
 
-Spring Boot Analyzer clones a repository into a temporary workspace and inspects it using [JGit](https://www.eclipse.org/jgit/), [JavaParser](https://javaparser.org/), and optionally the Gradle Tooling API. It produces a prioritized list of findings across security, configuration, persistence, transactions, HTTP surface, and code quality.
+The primary `springmaster` CLI discovers existing Git repositories beneath one
+explicit master root, creates bounded read-only snapshots, builds static local
+Maven/Gradle dependency edges, and analyzes repositories through persistent Java
+workers. Statically resolved dependencies contribute Java-source semantic facts
+to dependents without leaking dependency-owned findings into their reports.
+
+The Java CLI/web application can separately clone one remote repository with
+[JGit](https://www.eclipse.org/jgit/) and analyze it with
+[JavaParser](https://javaparser.org/). Both paths produce prioritized findings
+across security, configuration, persistence, transactions, HTTP surface, and
+code quality.
 
 **Default mode (`STATIC_ONLY`)** performs purely static analysis. It does not execute any code from the analyzed repository — no Gradle tasks, no Maven goals, no application startup, no test runs.
 
@@ -199,13 +249,28 @@ you explicitly want it and no hook of that name already exists:
 ./gradlew installGitHooks
 ```
 
+Install the binary and analyzer JAR as one user-local package. The command
+symlink goes under `~/.local/bin`; the paired runtime lives under
+`${XDG_DATA_HOME:-$HOME/.local/share}/springmaster`:
+
+```bash
+./scripts/install-cli.sh
+springmaster --help
+
+# Replace only an installation previously created by this script:
+./scripts/install-cli.sh --force
+```
+
+The installed command resolves its sibling `analyzer.jar` automatically.
+`--worker-command` remains available only as an explicit development/advanced
+override.
+
 Run a read-only scan of a master folder. `ROOT` is a positional argument; the
 command has no implicit current-directory scan. The benchmark harness below
 requires `ROOT` to be an existing absolute directory.
 
 ```bash
 ./dist/springmaster scan /srv/spring-repositories \
-  --worker-command "java -jar $PWD/dist/analyzer.jar --worker" \
   --cache-dir "$PWD/.springmaster-cache" \
   --workers 4 \
   --mode STATIC_ONLY
@@ -217,7 +282,6 @@ Gradle build logic:
 
 ```bash
 ./dist/springmaster scan /srv/trusted-spring-repositories \
-  --worker-command "java -jar $PWD/dist/analyzer.jar --worker" \
   --workers 2 \
   --mode EXTENDED \
   --trust-extended
@@ -245,7 +309,7 @@ shasum -a 256 -c SHA256SUMS
 
 tar -xzf springmaster_vX.Y.Z_darwin_arm64.tar.gz
 ./springmaster scan /absolute/master/root \
-  --worker-command "java -jar $PWD/analyzer.jar --worker"
+  --mode STATIC_ONLY
 ```
 
 ### Architecture and worker boundary
@@ -267,9 +331,12 @@ stay on stderr. Requests contain `schemaVersion`, `requestId`,
 or an analyzer failure is reported for that request and does not require the
 worker to exit. See [docs/WORKER_PROTOCOL.md](docs/WORKER_PROTOCOL.md).
 
-Maven/Gradle modules with Java sources are analyzed separately. A static
-cross-repository graph orders local dependencies first and propagates dependency
-content into cache identities, while unresolved dynamic build logic is reported
+Each Git repository is submitted once. Declared Maven/Gradle modules share one
+parsed source snapshot, while independent deployable applications retain
+module-owned Boot, Java, MVC/WebFlux, configuration, and runtime findings. A
+static cross-repository graph orders local dependencies first, propagates their
+content into cache identities, and materializes a bounded Java-source-only
+semantic overlay for dependents. Unresolved dynamic build logic is reported
 without executing the target build.
 
 Cache entries are content-addressed. The logical key is:
@@ -302,6 +369,19 @@ The existing Java analyzer and its Go control plane are distributed under the
 repository's [Apache-2.0 license](LICENSE), with the Java analyzer based on the
 upstream `RobbanHoglund/spring-boot-analyzer` project. Preserve upstream license
 and attribution notices in redistributed builds.
+
+### Current verification baseline
+
+Verified on 2026-08-26:
+
+- Java: 696 tests, zero failures; Spotless and `bootJar` pass
+- Go: `go test -race ./...` and `go vet ./...` pass
+- Frontend: 95 Vitest tests; `npm audit` reports zero vulnerabilities
+- External corpus: Spring Petclinic, Petclinic Microservices, and the Spring
+  multi-module guide complete without repository failures
+- Cross-repository fixture: dependency `@ConfigurationProperties` resolves in
+  the dependent repository, while dependency behavioral annotations and
+  findings remain isolated
 
 In Docker (no web server started):
 ```bash
@@ -344,7 +424,7 @@ docker run -p 8085:8085 \
 
 ---
 
-## Quick start
+## Web application quick start
 
 **Requirements:** Java 25, Node 22, Git.
 
@@ -603,7 +683,9 @@ Rule IDs are listed in [docs/RULES.md](docs/RULES.md).
 - **No server-side credential storage.** HTTPS tokens are held in browser `localStorage` and transmitted only as part of an `/api/analyze` request. The backend does not persist them.
 - **`STATIC_ONLY` mode (default) does not execute repository code.** It performs purely static analysis — no Gradle tasks, no Maven goals, no shell scripts, no application startup.
 - **`EXTENDED` mode uses the Gradle Tooling API** to resolve dependency information. This may evaluate repository-controlled Gradle build configuration logic. Use it only for repositories you trust or inside an isolated sandbox. See [SECURITY.md](SECURITY.md).
-- **Temporary workspaces.** Cloned repositories are written to a temporary workspace directory and cleaned up after analysis.
+- **Temporary workspaces.** The Java remote-repository surface clones into a
+  temporary workspace. `springmaster` instead creates bounded private snapshots
+  of existing local repositories and removes each after its cache/worker phase.
 - **SSH repositories** use the SSH configuration of the server running the backend (e.g., `~/.ssh/known_hosts`, agent forwarding).
 
 ---
@@ -614,7 +696,13 @@ Spring Boot Analyzer is a static analysis tool. Its findings are advisory — no
 
 - **Dynamic behavior is not visible.** Runtime decisions, reflection, and dynamic proxies cannot be fully analyzed statically.
 - **Generated code is partially supported.** Lombok, MapStruct, and similar annotation processors generate bytecode that is not in the source tree. The analyzer reports this when the Gradle model confirms processors are present.
-- **Multi-module projects have partial support.** Dependency resolution across modules requires `EXTENDED` mode and a working Gradle build.
+- **Static build graphs are intentionally bounded.** Declared Maven modules and
+  statically quoted Gradle includes are supported. Dynamic Gradle includes,
+  custom `projectDir`, composite builds, and ambiguous coordinates are reported
+  without executing build logic in `STATIC_ONLY`.
+- **Cross-repository context is source-only.** Statically resolved local
+  dependencies contribute Java semantic facts, not binary classpaths,
+  dependency resources, or repository build-script behavior.
 - **Unconventional build setups may produce fewer findings.** The analyzer is optimized for standard Spring Boot projects.
 - **All findings require human review.** Use the analyzer to focus attention, not to replace code review or testing.
 

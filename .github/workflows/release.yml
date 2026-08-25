@@ -210,7 +210,6 @@ jobs:
 
           report="$verify_root/scan.json"
           "$package_dir/springmaster" scan "$fixture" \
-            --worker-command "java -jar $package_dir/analyzer.jar --worker" \
             --mode STATIC_ONLY \
             --format json \
             --fail-on none \

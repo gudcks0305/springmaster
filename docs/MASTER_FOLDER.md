@@ -25,7 +25,6 @@ The root must be supplied explicitly as an existing absolute directory:
 
 ```bash
 ./springmaster scan /srv/spring-repositories \
-  --worker-command "java -jar $PWD/build/libs/spring-boot-analyzer.jar --worker" \
   --mode STATIC_ONLY
 ```
 
@@ -86,7 +85,6 @@ example:
 ```bash
 ./springmaster scan /srv/spring-repositories \
   --cache-dir /var/tmp/springmaster-cache \
-  --worker-command "java -jar $PWD/build/libs/spring-boot-analyzer.jar --worker" \
   --workers 4
 ```
 

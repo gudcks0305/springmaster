@@ -169,9 +169,6 @@ func parseScanArgs(arguments []string) (scanOptions, error) {
 	if options.root == "" {
 		return scanOptions{}, fmt.Errorf("scan requires ROOT")
 	}
-	if strings.TrimSpace(options.workerCommand) == "" {
-		return scanOptions{}, fmt.Errorf("--worker-command is required")
-	}
 	if options.mode == "EXTENDED" && !options.trustExtended {
 		return scanOptions{}, fmt.Errorf("--mode EXTENDED requires explicit --trust-extended")
 	}

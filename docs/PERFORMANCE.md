@@ -56,10 +56,10 @@ Optional binary override:
 ```
 
 The harness options `--master-root` and `--java-jar` are wrapper options. Each
-run invokes the actual CLI as `springmaster scan ROOT --worker-command ...
---cache-dir PRIVATE_TEMP`. Use `--worker-command` instead of `--java-jar` when
-the worker needs a custom executable or JVM flags; it is passed as one argv
-value and is never evaluated by a shell.
+run invokes the actual CLI with a private cache and an explicit worker override
+so benchmarks can pin one analyzer artifact. Normal paired installations find
+their bundled `analyzer.jar` automatically. A custom worker command is passed as
+one argv value and is never evaluated by a shell.
 
 The script prints tab-separated rows with phase, iteration, worker count,
 wall-clock seconds, and process exit status. It intentionally collects wall

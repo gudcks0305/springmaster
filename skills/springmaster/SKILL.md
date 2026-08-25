@@ -34,9 +34,9 @@ Resolve the runtime in this order; stop at the first complete pair. Do not run
 a broad `find` over the filesystem or infer a checkout from an unrelated
 directory.
 
-1. If `command -v springmaster` succeeds, use that executable and look for a
-   sibling `analyzer.jar` in its directory. If the release layout differs,
-   set `SPRINGMASTER_HOME` to the directory containing that binary/JAR pair.
+1. If `command -v springmaster` succeeds, use it. A standard installation
+   resolves the real executable symlink and its sibling `analyzer.jar`
+   automatically.
 2. If `SPRINGMASTER_HOME` is set, check only these exact layouts:
    `"$SPRINGMASTER_HOME/springmaster"` + `"$SPRINGMASTER_HOME/analyzer.jar"`,
    or the checkout layout `"$SPRINGMASTER_HOME/dist/springmaster"` +
@@ -46,25 +46,25 @@ directory.
    `dist/springmaster` and `dist/analyzer.jar` paths. Ask for the path if it is
    not supplied; do not search `$HOME`, `/Users`, `/`, or other broad roots.
 
-Set `SPRINGMASTER_BIN` and `SPRINGMASTER_JAR` to the first complete pair before
-running the scan. If the PATH candidate has no sibling JAR, continue with the
-explicit `SPRINGMASTER_HOME` or `SPRINGMASTER_CHECKOUT` candidates; never guess
-from another installed analyzer.
+Set `SPRINGMASTER_BIN` to the selected executable. If the PATH candidate is not
+a paired installation, continue with the explicit `SPRINGMASTER_HOME` or
+`SPRINGMASTER_CHECKOUT` candidates; never guess another analyzer JAR.
 
 Verify the selected binary is executable and the JAR is a regular file. If
 the explicit checkout pair is missing, build only that checkout with
 `./scripts/build.sh` (or `make build`), then verify both paths; do not silently
-substitute a remote binary or HTTP analyzer. The worker command is one CLI
-argument parsed without a shell:
+substitute a remote binary or HTTP analyzer. The paired JAR is automatic:
 
 ```bash
 "$SPRINGMASTER_BIN" scan "$MASTER_ROOT" \
-  --worker-command "java -jar \"$SPRINGMASTER_JAR\" --worker" \
   --mode STATIC_ONLY \
   --workers 2 \
   --format json
 # No --cache-dir: uses the OS user cache directory under springmaster.
 ```
+
+Use `SPRINGMASTER_ANALYZER_JAR=/absolute/path/analyzer.jar` or
+`--worker-command COMMAND` only as an explicit advanced override.
 
 Choose a finite, small `--workers N` value (start at `1` or `2`, then increase
 only when memory/CPU allow it). Workers are persistent JVMs; an unbounded or
@@ -147,3 +147,11 @@ From this checkout:
 The helper copies to exactly `${CODEX_HOME:-$HOME/.codex}/skills/springmaster`.
 It rejects an existing destination unless `--force`, validates the target, and
 never removes sibling skills or unrelated files.
+
+Install the paired CLI runtime separately:
+
+```bash
+./scripts/install-cli.sh --build
+# update only an existing managed installation:
+./scripts/install-cli.sh --build --force
+```

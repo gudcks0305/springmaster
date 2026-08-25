@@ -119,9 +119,9 @@ func runScan(ctx context.Context, options scanOptions, stdout, stderr io.Writer)
 		fmt.Fprintln(stderr, "WARNING: EXTENDED executes repository-controlled build logic. --trust-extended is consent, not a sandbox; use a disposable restricted environment.")
 	}
 
-	command, err := splitCommand(options.workerCommand)
+	command, err := resolveWorkerCommand(options.workerCommand)
 	if err != nil {
-		fmt.Fprintf(stderr, "invalid --worker-command: %v\n", err)
+		fmt.Fprintf(stderr, "resolve analyzer worker: %v\n", err)
 		return exitInvalidArgs
 	}
 	workerIdentity, err := commandIdentity(command)
@@ -1187,10 +1187,10 @@ func splitCommand(value string) ([]string, error) {
 
 func writeUsage(output io.Writer) {
 	fmt.Fprint(output, `Usage:
-  springmaster scan ROOT --worker-command 'java -jar analyzer-worker.jar' [flags]
+  springmaster scan ROOT [flags]
 
 Flags:
-  --worker-command COMMAND  analyzer worker executable and arguments (required)
+  --worker-command COMMAND  override bundled analyzer worker command
   --workers N               persistent worker count (default 1)
   --mode MODE               STATIC_ONLY or EXTENDED (default STATIC_ONLY)
   --trust-extended          required consent for EXTENDED; does not sandbox it

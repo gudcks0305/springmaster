@@ -14,7 +14,8 @@ ANALYZER_JAR ?= $(DIST_DIR)/analyzer.jar
 ANALYZER_JAR_SOURCE ?= build/libs/spring-boot-analyzer.jar
 
 .PHONY: all fmt go-fmt gofmt vet go-vet govet test go-test race go-race build go-build \
-	gradle-test java-test bootJar gradle-bootJar java-bootJar java-build frontend-build package clean
+	gradle-test java-test bootJar gradle-bootJar java-bootJar java-build frontend-build package \
+	install-cli reinstall-cli clean
 
 all: test build
 
@@ -58,6 +59,12 @@ test: go-test gradle-test
 build: go-build gradle-bootJar
 
 package: build
+
+install-cli: build
+	./scripts/install-cli.sh
+
+reinstall-cli: build
+	./scripts/install-cli.sh --force
 
 # Narrow, opt-in cleanup only. Never remove source trees, caches, or workspace
 # data from this target.
