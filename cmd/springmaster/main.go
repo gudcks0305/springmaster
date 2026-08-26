@@ -34,7 +34,7 @@ const (
 	maxRuleConfigBytes         int64 = 8 << 20
 	maxRunSnapshotRepositories       = 128
 	maxRunSnapshotFiles              = 200_000
-	maxRunSnapshotBytes        int64 = 1 << 30
+	maxRunSnapshotBytes        int64 = 2 << 30
 )
 
 func main() {

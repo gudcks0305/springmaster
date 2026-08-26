@@ -126,8 +126,8 @@ secrets, and absolute config paths feed only SHA-256 identity material; reports
 and cache diagnostics do not expose them.
 
 A scan accepts at most 128 discovered repositories and holds at most 200,000
-snapshot manifest entries or 1 GiB of copied bytes across the run. Per-repository
-snapshot limits still apply. After the exact dependency graph and required
+snapshot manifest entries or 2 GiB of copied bytes across the run. Each repository
+is limited to 50,000 entries and 1 GiB. After the exact dependency graph and required
 semantic context are materialized, cache-hit snapshots are removed immediately;
 miss snapshots are removed as soon as their worker response completes.
 

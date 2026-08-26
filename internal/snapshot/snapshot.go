@@ -28,7 +28,7 @@ const (
 	// an unbounded or unexpectedly large snapshot.
 	DefaultMaxFiles      = 50_000
 	DefaultMaxFileBytes  = int64(64 << 20)
-	DefaultMaxTotalBytes = int64(512 << 20)
+	DefaultMaxTotalBytes = int64(1 << 30)
 	DefaultMaxDepth      = 64
 )
 
