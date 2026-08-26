@@ -115,6 +115,16 @@ protocol schema invalidates old results rather than reusing a possibly
 incompatible payload. Cache writes belong under `--cache-dir` only; target
 repositories remain input data.
 
+Completed clean `STATIC_ONLY` workspace scans also store a versioned replay record containing
+only references to the existing exact analysis keys. On a later matching Git
+state, the coordinator securely recomputes the normal snapshot content hashes
+without materializing snapshot files and checks every referenced private cache
+entry. Only a complete workspace match returns early; uncertainty or mismatch
+falls back to the normal snapshot, dependency-overlay, and worker flow. Branch
+names are not identity, so two branches pointing at the same verified commit can
+replay the same result. `EXTENDED`, dirty, and non-standard Git states are never
+replay candidates.
+
 The rule/config identity hashes the content or missing state of
 `~/.spring-boot-analyzer/rule-config.json`, including candidate homes supplied
 through JVM `-Duser.home` options. Files larger than 8 MiB are rejected rather

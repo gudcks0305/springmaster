@@ -98,6 +98,13 @@ JVM. If explicit trust, the required flag, or isolation are absent, stay in
   excludes worker count. A copied dirty,
   untracked, ignored, nested-repository, or statically resolved local dependency
   change therefore gets a new key.
+- Keep the cache enabled for ordinary branch switching. A fully clean, tracked
+  `STATIC_ONLY` workspace can print `cache replay:` after securely confirming the exact source
+  bytes and reuse prior exact result keys without writing snapshots or starting
+  the Java worker. Dirty, staged, untracked, relevant ignored, sparse, filtered,
+  submodule, `EXTENDED`, or otherwise uncertain Git states automatically use
+  the normal snapshot path. Replay is workspace-wide, so one ineligible repository makes
+  that scan fall back; never describe it as file-level incremental indexing.
 - Use `--format json` for aggregation/comparison and `--format text` for a
   human-readable one-off review. Use `--output PATH` when the report must be
   retained; treat it as local potentially sensitive output.

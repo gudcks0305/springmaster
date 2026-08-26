@@ -351,7 +351,16 @@ position are not cache inputs. A dirty change therefore produces a new key
 without changing or cleaning the worktree. Local Maven/Gradle dependencies are
 folded into an effective hash, so a dependency repository change invalidates
 its dependents. Regular files named by the worker command (including the
-analyzer JAR) are content-hashed. See [docs/MASTER_FOLDER.md](docs/MASTER_FOLDER.md) and
+analyzer JAR) are content-hashed.
+
+For a fully clean, tracked `STATIC_ONLY` workspace, the coordinator also records a
+workspace-level replay pointer to those exact cache keys. Returning to an
+already-scanned branch first verifies Git state and securely hashes the included
+source bytes without writing snapshots. If every exact hash and cache entry
+still matches, the scan returns before creating a snapshot root or starting the
+Java worker. `EXTENDED`, dirty, staged, untracked, relevant ignored, sparse, filtered, or
+otherwise uncertain worktrees use the normal snapshot path. `--no-cache`
+bypasses replay as well as the result cache. See [docs/MASTER_FOLDER.md](docs/MASTER_FOLDER.md) and
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ### Control-plane exit codes

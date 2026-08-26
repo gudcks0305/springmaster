@@ -22,7 +22,8 @@ func newTestStore(t *testing.T) *Store {
 func TestStoreRoundTripUsesSafeAtomicEntryName(t *testing.T) {
 	store := newTestStore(t)
 	key := "../../outside/entry"
-	value := json.RawMessage(`{"findingCount":2,"status":"completed"}`)
+	value := json.RawMessage("{\n  \"findingCount\": 2,\n  \"status\": \"completed\"\n}")
+	wantValue := json.RawMessage(`{"findingCount":2,"status":"completed"}`)
 	if err := store.Put(context.Background(), key, value); err != nil {
 		t.Fatalf("Put() error = %v", err)
 	}
@@ -30,8 +31,8 @@ func TestStoreRoundTripUsesSafeAtomicEntryName(t *testing.T) {
 	if err != nil || !hit {
 		t.Fatalf("Get() = (%s, %t, %v), want cache hit", got, hit, err)
 	}
-	if string(got) != string(value) {
-		t.Errorf("Get() = %s, want %s", got, value)
+	if string(got) != string(wantValue) {
+		t.Errorf("Get() = %s, want compact %s", got, wantValue)
 	}
 	entries, err := os.ReadDir(store.root)
 	if err != nil {
@@ -283,6 +284,27 @@ func TestGetTreatsUnsafeTamperedAndPreseededEntriesAsMiss(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertMiss("malformed JSON")
+
+	if err := store.Put(context.Background(), key, value); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(entryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var validButMutable entry
+	if err := json.Unmarshal(contents, &validButMutable); err != nil {
+		t.Fatal(err)
+	}
+	validButMutable.Value = json.RawMessage(`{"status":"different"}`)
+	validJSONTamper, err := json.Marshal(validButMutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entryPath, validJSONTamper, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertMiss("valid JSON with mismatched value digest")
 
 	tampered, err := json.Marshal(entry{SchemaVersion: entrySchemaVersion + 1, Key: key, Provenance: store.marker.Nonce, Value: value})
 	if err != nil {

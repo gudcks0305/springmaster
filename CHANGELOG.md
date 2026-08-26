@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Exact clean-workspace cache replay for `STATIC_ONLY` scans, allowing verified
+  branch returns to skip snapshot writes, JVM startup, and Java source indexing
+- SHA-256 integrity verification for every cached JSON value; valid-JSON disk
+  corruption is treated as a miss and recomputed
 - New **Spring Boot 3 Migration** category with six rules: `SPRING_SECURITY_WEBSECURITYCONFIGURERADAPTER`, `SPRING_SECURITY_ANTMATCHERS_REMOVED`, `SPRING_SECURITY_ENABLE_GLOBAL_METHOD_SECURITY`, `SPRING_JAKARTA_NAMESPACE_ON_BOOT3` (gated on a detected Spring Boot 3+ version), `SPRING_PROFILES_PROPERTY_DEPRECATED`, and `SPRING_ACTUATOR_HTTPTRACE_RENAMED`
 - Four additional security rules: `SPRING_JDBC_URL_EMBEDDED_CREDENTIALS`, `SPRING_DEFAULT_USER_PASSWORD_LITERAL`, `SPRING_LOGGING_AUTH_HEADER`, and `SPRING_BCRYPT_LOW_STRENGTH`
 - Three additional reliability rules: `SPRING_RESTTEMPLATE_NEW_PER_REQUEST`, `SPRING_JPA_QUERY_NO_PAGINATION`, and `SPRING_REQUIRES_NEW_IN_LOOP`

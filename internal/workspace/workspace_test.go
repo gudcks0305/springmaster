@@ -255,6 +255,193 @@ func TestDiscoverHashesDirtyNestedGitRepositoryContent(t *testing.T) {
 	}
 }
 
+func TestReplayEligibilityRequiresCleanRelevantContent(t *testing.T) {
+	tests := map[string]func(*testing.T, string){
+		"tracked": func(t *testing.T, repository string) {
+			if err := os.WriteFile(filepath.Join(repository, "src", "App.java"), []byte("class Changed {}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"staged": func(t *testing.T, repository string) {
+			if err := os.WriteFile(filepath.Join(repository, "src", "App.java"), []byte("class Staged {}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git(t, repository, "add", "src/App.java")
+		},
+		"untracked": func(t *testing.T, repository string) {
+			if err := os.WriteFile(filepath.Join(repository, "source.txt"), []byte("source"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"ignored": func(t *testing.T, repository string) {
+			if err := os.WriteFile(filepath.Join(repository, "ignored.txt"), []byte("ignored"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			repository := makeRepository(t, root, "repo", map[string]string{
+				".gitignore":   "ignored.txt\n",
+				"pom.xml":      "<project>spring-boot</project>",
+				"src/App.java": "import org.springframework.context.ApplicationContext; class App {}",
+			})
+			mutate(t, repository)
+			repositories, err := Discover(context.Background(), root, Options{EnableReplay: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := findRepository(t, repositories, repository)
+			if got.ReplayEligible || ValidateReplayState(context.Background(), got) {
+				t.Fatalf("replay state = %#v, want ineligible", got)
+			}
+		})
+	}
+}
+
+func TestReplayEligibilityIgnoresExcludedIgnoredOutput(t *testing.T) {
+	root := t.TempDir()
+	repository := makeRepository(t, root, "repo", map[string]string{
+		".gitignore":   "build/\n",
+		"pom.xml":      "<project>spring-boot</project>",
+		"src/App.java": "import org.springframework.context.ApplicationContext; class App {}",
+	})
+	if err := os.MkdirAll(filepath.Join(repository, "build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "build", "generated.txt"), []byte("ignored"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repositories, err := Discover(context.Background(), root, Options{EnableReplay: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findRepository(t, repositories, repository)
+	if !got.ReplayEligible || !ValidateReplayState(context.Background(), got) {
+		t.Fatalf("replay state = %#v, want eligible", got)
+	}
+}
+
+func TestReplayEligibilityRejectsUncertainGitState(t *testing.T) {
+	tests := map[string]func(*testing.T, string){
+		"attributes": func(t *testing.T, repository string) {
+			if err := os.WriteFile(filepath.Join(repository, ".gitattributes"), []byte("* text=auto\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git(t, repository, "add", ".gitattributes")
+			git(t, repository, "commit", "-m", "attributes")
+		},
+		"gitmodules": func(t *testing.T, repository string) {
+			if err := os.WriteFile(filepath.Join(repository, ".gitmodules"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git(t, repository, "add", ".gitmodules")
+			git(t, repository, "commit", "-m", "gitmodules")
+		},
+		"sparse checkout": func(t *testing.T, repository string) {
+			git(t, repository, "config", "core.sparseCheckout", "true")
+		},
+		"autocrlf": func(t *testing.T, repository string) {
+			git(t, repository, "config", "core.autocrlf", "input")
+		},
+		"eol": func(t *testing.T, repository string) {
+			git(t, repository, "config", "core.eol", "crlf")
+		},
+		"filter config": func(t *testing.T, repository string) {
+			git(t, repository, "config", "filter.example.clean", "sed s/a/b/")
+		},
+		"info attributes": func(t *testing.T, repository string) {
+			if err := os.WriteFile(filepath.Join(repository, ".git", "info", "attributes"), []byte("*.java filter=example\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"assume unchanged": func(t *testing.T, repository string) {
+			git(t, repository, "update-index", "--assume-unchanged", "src/App.java")
+		},
+		"skip worktree": func(t *testing.T, repository string) {
+			git(t, repository, "update-index", "--skip-worktree", "src/App.java")
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			repository := makeRepository(t, root, "repo", map[string]string{
+				"pom.xml":      "<project>spring-boot</project>",
+				"src/App.java": "import org.springframework.context.ApplicationContext; class App {}",
+			})
+			mutate(t, repository)
+			repositories, err := Discover(context.Background(), root, Options{EnableReplay: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := findRepository(t, repositories, repository); got.ReplayEligible {
+				t.Fatalf("replay state = %#v, want ineligible", got)
+			}
+		})
+	}
+}
+
+func TestValidateReplayStateUsesHeadAndContentNotBranch(t *testing.T) {
+	root := t.TempDir()
+	repository := makeRepository(t, root, "repo", map[string]string{
+		"pom.xml":      "<project>spring-boot</project>",
+		"src/App.java": "import org.springframework.context.ApplicationContext; class App {}",
+	})
+	disabled, err := Discover(context.Background(), root, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := findRepository(t, disabled, repository); got.ReplayEligible {
+		t.Fatalf("default replay state = %#v, want disabled", got)
+	}
+	repositories, err := Discover(context.Background(), root, Options{EnableReplay: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := findRepository(t, repositories, repository)
+	if !expected.ReplayEligible {
+		t.Fatalf("clean repository replay state = %#v, want eligible", expected)
+	}
+	git(t, repository, "branch", "-m", "renamed")
+	if !ValidateReplayState(context.Background(), expected) {
+		t.Fatal("branch-only change invalidated replay state")
+	}
+
+	wrongContent := expected
+	wrongContent.ContentHash += "-different"
+	if ValidateReplayState(context.Background(), wrongContent) {
+		t.Fatal("content token mismatch accepted")
+	}
+	wrongHead := expected
+	wrongHead.Head = strings.Repeat("0", len(expected.Head))
+	if ValidateReplayState(context.Background(), wrongHead) {
+		t.Fatal("HEAD mismatch accepted")
+	}
+}
+
+func TestReplayEligibilityRejectsRepositoryWithoutHead(t *testing.T) {
+	root := t.TempDir()
+	repository := filepath.Join(root, "repo")
+	if err := os.MkdirAll(filepath.Join(repository, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "pom.xml"), []byte("<project>spring-boot</project>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository, "src", "App.java"), []byte("import org.springframework.context.ApplicationContext; class App {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repository, "init", "-b", "main")
+	repositories, err := Discover(context.Background(), root, Options{EnableReplay: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := findRepository(t, repositories, repository); got.Head != "" || got.ReplayEligible {
+		t.Fatalf("unborn repository state = %#v, want empty HEAD and ineligible", got)
+	}
+}
+
 func findRepository(t *testing.T, repositories []Repository, path string) Repository {
 	t.Helper()
 	for _, repository := range repositories {

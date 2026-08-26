@@ -10,3 +10,7 @@ import (
 func secureCopyTree(_ context.Context, _, _ string, _ map[string]struct{}, _ *[]Diagnostic, _ *copyState) error {
 	return fmt.Errorf("%w: descriptor-relative no-follow walk unavailable", ErrSecureTraversalUnsupported)
 }
+
+func secureContentTree(_ context.Context, _ string, _ map[string]struct{}, _ *copyState) error {
+	return fmt.Errorf("%w: descriptor-relative no-follow walk unavailable", ErrSecureTraversalUnsupported)
+}

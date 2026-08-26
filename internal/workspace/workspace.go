@@ -36,10 +36,12 @@ var errOutputLimit = errors.New("git output exceeds configured limit")
 // Options controls repository discovery. MaxDepth is counted from root; zero
 // means no depth limit. Include and Exclude use slash-separated glob patterns.
 // A pattern without a slash also matches the repository directory name.
+// EnableReplay opts into the additional Git checks needed for safe cache replay.
 type Options struct {
 	MaxDepth     int
 	Include      []string
 	Exclude      []string
+	EnableReplay bool
 	OnDiagnostic func(Diagnostic)
 }
 
@@ -54,14 +56,15 @@ type Diagnostic struct {
 
 // Repository is the immutable Git state passed to an analyzer worker.
 type Repository struct {
-	ID          string
-	Path        string
-	Branch      string
-	Head        string
-	RemoteURL   string
-	ContentHash string
-	Dirty       bool
-	Untracked   bool
+	ID             string
+	Path           string
+	Branch         string
+	Head           string
+	RemoteURL      string
+	ContentHash    string
+	Dirty          bool
+	Untracked      bool
+	ReplayEligible bool
 }
 
 // Discover recursively finds Spring Git repositories below root. It never
@@ -139,7 +142,7 @@ func Discover(ctx context.Context, root string, options Options) ([]Repository, 
 			return nil
 		}
 
-		repository, err := inspectRepository(ctx, runner, current)
+		repository, err := inspectRepository(ctx, runner, current, options.EnableReplay)
 		if err != nil {
 			return err
 		}
@@ -154,7 +157,7 @@ func Discover(ctx context.Context, root string, options Options) ([]Repository, 
 	return repositories, nil
 }
 
-func inspectRepository(ctx context.Context, runner gitRunner, root string) (Repository, error) {
+func inspectRepository(ctx context.Context, runner gitRunner, root string, enableReplay bool) (Repository, error) {
 	inside, err := runner.run(ctx, root, "rev-parse", "--is-inside-work-tree")
 	if err != nil {
 		return Repository{}, fmt.Errorf("verify Git repository %s: %w", root, err)
@@ -198,7 +201,7 @@ func inspectRepository(ctx context.Context, runner gitRunner, root string) (Repo
 		return Repository{}, fmt.Errorf("hash repository content for %s: %w", root, err)
 	}
 
-	return Repository{
+	repository := Repository{
 		ID:          repositoryID(root, remoteURL),
 		Path:        root,
 		Branch:      strings.TrimSpace(branch),
@@ -207,7 +210,123 @@ func inspectRepository(ctx context.Context, runner gitRunner, root string) (Repo
 		ContentHash: contentHash,
 		Dirty:       len(changes) > 0,
 		Untracked:   anyUntracked(changes),
-	}, nil
+	}
+	if enableReplay {
+		repository.ReplayEligible = ValidateReplayState(ctx, repository)
+	}
+	return repository, nil
+}
+
+// ValidateReplayState reports whether expected still identifies a clean,
+// tracked-only working tree that can safely reuse content from the same HEAD.
+// Branch names are intentionally irrelevant: switching branches without
+// changing HEAD or content preserves replay eligibility. Git errors and states
+// whose working-tree bytes cannot be proven from HEAD fail closed.
+func ValidateReplayState(ctx context.Context, expected Repository) bool {
+	if expected.Path == "" || expected.Head == "" || expected.ContentHash == "" {
+		return false
+	}
+	runner := gitRunner{outputLimit: maxGitOutputBytes}
+
+	headBefore, err := runner.run(ctx, expected.Path, "rev-parse", "--verify", "HEAD")
+	if err != nil || strings.TrimSpace(headBefore) != expected.Head {
+		return false
+	}
+	if !replayConfigurationSafe(ctx, runner, expected.Path) {
+		return false
+	}
+
+	statusOutput, err := runner.run(ctx, expected.Path,
+		"-c", "core.fsmonitor=false",
+		"--no-optional-locks", "status", "--porcelain=v1", "-z", "--no-renames",
+		"--untracked-files=all", "--ignored=matching", "--ignore-submodules=none")
+	if err != nil {
+		return false
+	}
+	changes, err := parseStatus([]byte(statusOutput))
+	if err != nil {
+		return false
+	}
+	for _, change := range changes {
+		if relevantRepositoryPath(change.path) || (change.from != "" && relevantRepositoryPath(change.from)) {
+			return false
+		}
+	}
+
+	contentHash, err := hashRepositoryContent(ctx, runner, expected.Path, expected.Head, changes)
+	if err != nil || contentHash != expected.ContentHash {
+		return false
+	}
+	headAfter, err := runner.run(ctx, expected.Path, "rev-parse", "--verify", "HEAD")
+	return err == nil && strings.TrimSpace(headAfter) == expected.Head
+}
+
+func replayConfigurationSafe(ctx context.Context, runner gitRunner, root string) bool {
+	for _, key := range []string{"core.autocrlf", "core.eol", "core.attributesfile"} {
+		value, err := runner.run(ctx, root, "config", "--get", key)
+		if err != nil {
+			if hasExitCode(err, 1) {
+				continue
+			}
+			return false
+		}
+		if strings.TrimSpace(value) != "" && !(key == "core.autocrlf" && strings.EqualFold(strings.TrimSpace(value), "false")) {
+			return false
+		}
+	}
+	filters, err := runner.run(ctx, root, "config", "--get-regexp", "^filter\\.")
+	if err != nil {
+		if !hasExitCode(err, 1) {
+			return false
+		}
+	} else if strings.TrimSpace(filters) != "" {
+		return false
+	}
+	attributesPath, err := runner.run(ctx, root, "rev-parse", "--git-path", "info/attributes")
+	if err != nil {
+		return false
+	}
+	attributesPath = strings.TrimSpace(attributesPath)
+	if attributesPath == "" {
+		return false
+	}
+	if !filepath.IsAbs(attributesPath) {
+		attributesPath = filepath.Join(root, attributesPath)
+	}
+	if _, err := os.Lstat(attributesPath); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+
+	sparse, err := runner.run(ctx, root, "config", "--bool", "--get", "core.sparseCheckout")
+	if err != nil {
+		if !hasExitCode(err, 1) {
+			return false
+		}
+	} else if strings.TrimSpace(sparse) != "false" {
+		return false
+	}
+
+	specialFiles, err := runner.run(ctx, root, "ls-files", "-z", "--",
+		".gitattributes", ":(glob)**/.gitattributes", ".gitmodules", ":(glob)**/.gitmodules")
+	if err != nil || specialFiles != "" {
+		return false
+	}
+	indexState, err := runner.run(ctx, root, "ls-files", "-v", "-z")
+	if err != nil {
+		return false
+	}
+	for _, record := range bytes.Split([]byte(indexState), []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		if len(record) < 3 || record[1] != ' ' {
+			return false
+		}
+		if record[0] == 'S' || (record[0] >= 'a' && record[0] <= 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 func springRepository(ctx context.Context, root string) (bool, error) {
@@ -611,7 +730,7 @@ func relevantRepositoryPath(relativePath string) bool {
 
 func ignoredContentPath(part string) bool {
 	switch part {
-	case ".git", "build", "target", "node_modules":
+	case ".git", "build", "target", "node_modules", ".gradle", ".springmaster", "dist", ".idea", ".vscode":
 		return true
 	default:
 		return false

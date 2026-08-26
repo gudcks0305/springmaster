@@ -238,6 +238,12 @@ func TestRunScanMaterializesCrossRepositoryDependencyContext(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(service, "src", "main", "java", "Service.java"), []byte("class Service extends Shared {}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	for _, repository := range []string{library, service} {
+		gitCommand(t, repository, "config", "user.email", "test@example.test")
+		gitCommand(t, repository, "config", "user.name", "Springmaster Test")
+		gitCommand(t, repository, "add", ".")
+		gitCommand(t, repository, "commit", "-m", "dependency-replay")
+	}
 
 	state := t.TempDir()
 	arguments := []string{
@@ -257,6 +263,19 @@ func TestRunScanMaterializesCrossRepositoryDependencyContext(t *testing.T) {
 	if strings.Contains(stdout.String(), "Shared.java") {
 		t.Fatalf("dependency overlay finding leaked into owner report: %s", stdout.String())
 	}
+
+	t.Setenv("SPRINGMASTER_TEST_WORKER_FAIL_ALL", "1")
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(t.Context(), arguments, &stdout, &stderr); code != exitClean {
+		t.Fatalf("dependency replay code=%d stderr=%s report=%s", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "cache replay: reused exact results for 2 repositories") ||
+		strings.Contains(stdout.String(), "Shared.java") ||
+		!strings.Contains(stdout.String(), "Findings: 2 ") {
+		t.Fatalf("dependency replay/filtering wrong: stderr=%s report=%s", stderr.String(), stdout.String())
+	}
+	t.Setenv("SPRINGMASTER_TEST_WORKER_FAIL_ALL", "0")
 
 	// The dependency is now a cache hit, while the changed dependent is a miss.
 	// Its already-materialized overlay must survive prompt dependency snapshot cleanup.
@@ -685,6 +704,141 @@ func TestRunScanUsesCompletedResultCacheUnlessDisabled(t *testing.T) {
 	}
 }
 
+func TestRunScanReplaysExactResultsAcrossBranchRoundTrip(t *testing.T) {
+	t.Setenv("SPRINGMASTER_TEST_WORKER", "1")
+	t.Setenv("HOME", t.TempDir())
+	master := t.TempDir()
+	repository := makeSpringRepository(t, master, "branch-replay", false)
+	gitCommand(t, repository, "config", "user.email", "test@example.test")
+	gitCommand(t, repository, "config", "user.name", "Springmaster Test")
+	gitCommand(t, repository, "add", ".")
+	gitCommand(t, repository, "commit", "-m", "branch-a")
+	mainBranch := strings.TrimSpace(gitCommand(t, repository, "branch", "--show-current"))
+
+	state := t.TempDir()
+	countFile := filepath.Join(state, "worker-count")
+	snapshotCountFile := filepath.Join(state, "snapshot-root-count")
+	t.Setenv("SPRINGMASTER_TEST_WORKER_COUNT_FILE", countFile)
+	t.Setenv("SPRINGMASTER_TEST_RUN_SNAPSHOT_COUNT_FILE", snapshotCountFile)
+	arguments := []string{
+		"scan", master,
+		"--worker-command", testWorkerCommand(),
+		"--format", "json",
+		"--fail-on", "none",
+		"--cache-dir", filepath.Join(state, "cache"),
+	}
+	runScanForTest(t, arguments, exitClean)
+	assertWorkerStarts(t, countFile, 1)
+	assertMarkerCount(t, snapshotCountFile, "snapshot-root\n", 1)
+
+	gitCommand(t, repository, "switch", "-c", "same-content")
+	t.Setenv("SPRINGMASTER_TEST_WORKER_FAIL_ALL", "1")
+	_, aliasError := runScanForTest(t, arguments, exitClean)
+	if !strings.Contains(aliasError, "cache replay: reused exact results") {
+		t.Fatalf("same-content branch did not replay exact result: %s", aliasError)
+	}
+	assertWorkerStarts(t, countFile, 1)
+	assertMarkerCount(t, snapshotCountFile, "snapshot-root\n", 1)
+
+	t.Setenv("SPRINGMASTER_TEST_WORKER_FAIL_ALL", "0")
+	if err := os.WriteFile(
+		filepath.Join(repository, "src", "main", "java", "App.java"),
+		[]byte("@SpringBootApplication class BranchB {}"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	gitCommand(t, repository, "add", ".")
+	gitCommand(t, repository, "commit", "-m", "branch-b")
+	runScanForTest(t, arguments, exitClean)
+	assertWorkerStarts(t, countFile, 2)
+	assertMarkerCount(t, snapshotCountFile, "snapshot-root\n", 2)
+
+	gitCommand(t, repository, "switch", mainBranch)
+	t.Setenv("SPRINGMASTER_TEST_WORKER_FAIL_ALL", "1")
+	_, roundTripError := runScanForTest(t, arguments, exitClean)
+	if !strings.Contains(roundTripError, "cache replay: reused exact results") {
+		t.Fatalf("A-B-A branch return did not replay exact result: %s", roundTripError)
+	}
+	assertWorkerStarts(t, countFile, 2)
+	assertMarkerCount(t, snapshotCountFile, "snapshot-root\n", 2)
+}
+
+func TestRunScanDoesNotReplayDirtyWorkspace(t *testing.T) {
+	t.Setenv("SPRINGMASTER_TEST_WORKER", "1")
+	t.Setenv("HOME", t.TempDir())
+	master := t.TempDir()
+	repository := makeSpringRepository(t, master, "dirty-replay", false)
+	gitCommand(t, repository, "config", "user.email", "test@example.test")
+	gitCommand(t, repository, "config", "user.name", "Springmaster Test")
+	gitCommand(t, repository, "add", ".")
+	gitCommand(t, repository, "commit", "-m", "clean")
+
+	state := t.TempDir()
+	countFile := filepath.Join(state, "worker-count")
+	t.Setenv("SPRINGMASTER_TEST_WORKER_COUNT_FILE", countFile)
+	arguments := []string{
+		"scan", master,
+		"--worker-command", testWorkerCommand(),
+		"--format", "json",
+		"--fail-on", "none",
+		"--cache-dir", filepath.Join(state, "cache"),
+	}
+	runScanForTest(t, arguments, exitClean)
+	if err := os.WriteFile(
+		filepath.Join(repository, "src", "main", "java", "App.java"),
+		[]byte("@SpringBootApplication class Dirty {}"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SPRINGMASTER_TEST_WORKER_FAIL_ALL", "1")
+	stdout, stderr := runScanForTest(t, arguments, exitOperational)
+	if strings.Contains(stderr, "cache replay: reused exact results") ||
+		!strings.Contains(stdout, "TEST_FAILURE") {
+		t.Fatalf("dirty workspace reused replay: stderr=%s report=%s", stderr, stdout)
+	}
+	assertWorkerStarts(t, countFile, 2)
+}
+
+func TestRunScanRejectsValidJSONResultCacheCorruption(t *testing.T) {
+	t.Setenv("SPRINGMASTER_TEST_WORKER", "1")
+	t.Setenv("HOME", t.TempDir())
+	master := t.TempDir()
+	repository := makeSpringRepository(t, master, "corrupt-replay", false)
+	gitCommand(t, repository, "config", "user.email", "test@example.test")
+	gitCommand(t, repository, "config", "user.name", "Springmaster Test")
+	gitCommand(t, repository, "add", ".")
+	gitCommand(t, repository, "commit", "-m", "clean")
+
+	state := t.TempDir()
+	cacheDirectory := filepath.Join(state, "cache")
+	countFile := filepath.Join(state, "worker-count")
+	snapshotCountFile := filepath.Join(state, "snapshot-root-count")
+	t.Setenv("SPRINGMASTER_TEST_WORKER_COUNT_FILE", countFile)
+	t.Setenv("SPRINGMASTER_TEST_RUN_SNAPSHOT_COUNT_FILE", snapshotCountFile)
+	arguments := []string{
+		"scan", master,
+		"--worker-command", testWorkerCommand(),
+		"--format", "json",
+		"--fail-on", "none",
+		"--cache-dir", cacheDirectory,
+	}
+	runScanForTest(t, arguments, exitClean)
+	corruptCachedAnalysisResult(t, cacheDirectory)
+
+	t.Setenv("SPRINGMASTER_TEST_WORKER_FAIL_ALL", "1")
+	stdout, stderr := runScanForTest(t, arguments, exitOperational)
+	if strings.Contains(stderr, "cache replay: reused exact results") {
+		t.Fatalf("corrupt cached result was replayed: %s", stderr)
+	}
+	if !strings.Contains(stdout, "TEST_FAILURE") {
+		t.Fatalf("corrupt cached result did not force worker recomputation: %s", stdout)
+	}
+	assertWorkerStarts(t, countFile, 2)
+	assertMarkerCount(t, snapshotCountFile, "snapshot-root\n", 2)
+}
+
 func TestRunScanResultConfigurationChangesBypassCache(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -954,4 +1108,77 @@ func makeSpringRepository(t *testing.T, root, name string, workerFailure bool) s
 
 func testWorkerCommand() string {
 	return fmt.Sprintf("%q -test.run=^TestWorkerProcess$", os.Args[0])
+}
+
+func gitCommand(t *testing.T, directory string, arguments ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", directory}, arguments...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", arguments, err, output)
+	}
+	return string(output)
+}
+
+func runScanForTest(t *testing.T, arguments []string, wantCode int) (string, string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := run(t.Context(), arguments, &stdout, &stderr); code != wantCode {
+		t.Fatalf(
+			"scan code=%d, want %d; stderr=%s\nreport=%s",
+			code,
+			wantCode,
+			stderr.String(),
+			stdout.String(),
+		)
+	}
+	return stdout.String(), stderr.String()
+}
+
+func assertWorkerStarts(t *testing.T, countFile string, want int) {
+	t.Helper()
+	assertMarkerCount(t, countFile, "worker\n", want)
+}
+
+func assertMarkerCount(t *testing.T, countFile, marker string, want int) {
+	t.Helper()
+	contents, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(contents), marker); got != want {
+		t.Fatalf("marker %q count=%d, want %d; contents=%q", marker, got, want, contents)
+	}
+}
+
+func corruptCachedAnalysisResult(t *testing.T, cacheDirectory string) {
+	t.Helper()
+	entries, err := filepath.Glob(filepath.Join(cacheDirectory, "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		contents, err := os.ReadFile(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope map[string]any
+		if json.Unmarshal(contents, &envelope) != nil {
+			continue
+		}
+		value, ok := envelope["value"].(map[string]any)
+		if !ok || value["findings"] == nil {
+			continue
+		}
+		envelope["value"] = map[string]any{"findings": []any{}}
+		corrupted, err := json.Marshal(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(entry, corrupted, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	t.Fatal("analysis result cache entry not found")
 }

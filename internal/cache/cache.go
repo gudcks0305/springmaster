@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	entrySchemaVersion      = 2
+	entrySchemaVersion      = 3
 	markerSchemaVersion     = 1
 	markerName              = ".springmaster-cache-owner-v1"
 	markerNonceBytes        = 32
@@ -38,6 +38,7 @@ type entry struct {
 	SchemaVersion int             `json:"schemaVersion"`
 	Key           string          `json:"key"`
 	Provenance    string          `json:"provenance"`
+	ValueSHA256   string          `json:"valueSha256"`
 	Value         json.RawMessage `json:"value"`
 }
 
@@ -283,7 +284,11 @@ func (store *Store) Get(ctx context.Context, key string) (json.RawMessage, bool,
 	if err := json.Unmarshal(contents, &cached); err != nil {
 		return nil, false, nil
 	}
-	if cached.SchemaVersion != entrySchemaVersion || cached.Key != key || cached.Provenance != store.marker.Nonce || !json.Valid(cached.Value) {
+	if cached.SchemaVersion != entrySchemaVersion ||
+		cached.Key != key ||
+		cached.Provenance != store.marker.Nonce ||
+		!json.Valid(cached.Value) ||
+		cached.ValueSHA256 != valueSHA256(cached.Value) {
 		return nil, false, nil
 	}
 	postInfo, err := root.Lstat(name)
@@ -304,7 +309,18 @@ func (store *Store) Put(ctx context.Context, key string, value json.RawMessage) 
 	if !json.Valid(value) {
 		return errors.New("cache value must be valid JSON")
 	}
-	contents, err := json.Marshal(entry{SchemaVersion: entrySchemaVersion, Key: key, Provenance: store.marker.Nonce, Value: value})
+	normalized, err := json.Marshal(json.RawMessage(value))
+	if err != nil {
+		return fmt.Errorf("normalize cache value: %w", err)
+	}
+	value = json.RawMessage(normalized)
+	contents, err := json.Marshal(entry{
+		SchemaVersion: entrySchemaVersion,
+		Key:           key,
+		Provenance:    store.marker.Nonce,
+		ValueSHA256:   valueSHA256(value),
+		Value:         value,
+	})
 	if err != nil {
 		return fmt.Errorf("encode cache entry: %w", err)
 	}
@@ -367,6 +383,11 @@ func validKey(key string) error {
 		return errors.New("cache key is required")
 	}
 	return nil
+}
+
+func valueSHA256(value []byte) string {
+	digest := sha256.Sum256(value)
+	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
 func writeKeyPart(digest io.Writer, name, value string) {

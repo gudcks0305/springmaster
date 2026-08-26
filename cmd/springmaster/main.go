@@ -7,6 +7,7 @@ import (
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,8 @@ import (
 const (
 	workerSchemaVersion              = 1
 	resultFingerprintVersion         = "springmaster-result-fingerprint-v1"
+	replaySchemaVersion              = 1
+	replayFingerprintVersion         = "springmaster-workspace-replay-v1"
 	maxRuleConfigBytes         int64 = 8 << 20
 	maxRunSnapshotRepositories       = 128
 	maxRunSnapshotFiles              = 200_000
@@ -78,9 +81,10 @@ func runScan(ctx context.Context, options scanOptions, stdout, stderr io.Writer)
 	}
 	workspaceDiagnostics := make([]workspace.Diagnostic, 0)
 	repositories, err := workspace.Discover(ctx, root, workspace.Options{
-		MaxDepth: options.maxDepth,
-		Include:  options.include,
-		Exclude:  options.exclude,
+		MaxDepth:     options.maxDepth,
+		Include:      options.include,
+		Exclude:      options.exclude,
+		EnableReplay: !options.noCache && options.mode == "STATIC_ONLY",
 		OnDiagnostic: func(diagnostic workspace.Diagnostic) {
 			workspaceDiagnostics = append(workspaceDiagnostics, diagnostic)
 		},
@@ -141,6 +145,20 @@ func runScan(ctx context.Context, options scanOptions, stdout, stderr io.Writer)
 		if err != nil {
 			fmt.Fprintf(stderr, "open cache: %v\n", err)
 			return exitOperational
+		}
+	}
+	if resultCache != nil {
+		if replayed, found := tryWorkspaceReplay(
+			ctx,
+			resultCache,
+			workerIdentity,
+			resultFingerprint,
+			options,
+			repositories,
+			dependencyGraph,
+		); found {
+			fmt.Fprintf(stderr, "cache replay: reused exact results for %d repositories\n", len(replayed))
+			return finishScan(options, stdout, stderr, replayed)
 		}
 	}
 	runSnapshotRoot, err := createRunSnapshotRoot()
@@ -289,6 +307,21 @@ func runScan(ctx context.Context, options scanOptions, stdout, stderr io.Writer)
 			}
 		}
 	}
+	if resultCache != nil {
+		if err := storeWorkspaceReplay(
+			ctx,
+			resultCache,
+			workerIdentity,
+			resultFingerprint,
+			options,
+			repositories,
+			dependencyGraph,
+			prepared,
+			results,
+		); err != nil {
+			fmt.Fprintf(stderr, "cache replay: exact result set was not indexed: %v\n", err)
+		}
+	}
 	writeCacheDiagnostics(stderr, results)
 	for index := range prepared {
 		if prepared[index].snapshot == nil {
@@ -309,6 +342,10 @@ func runScan(ctx context.Context, options scanOptions, stdout, stderr io.Writer)
 		}
 	}
 
+	return finishScan(options, stdout, stderr, results)
+}
+
+func finishScan(options scanOptions, stdout, stderr io.Writer, results []report.Repository) int {
 	aggregated := report.Aggregate(results)
 	if err := writeReport(options, stdout, aggregated); err != nil {
 		fmt.Fprintf(stderr, "write report: %v\n", err)
@@ -347,6 +384,20 @@ func createRunSnapshotRoot() (string, error) {
 	}
 	if !info.IsDir() || info.Mode().Perm() != 0o700 {
 		return "", fmt.Errorf("snapshot root is not a private 0700 directory")
+	}
+	if countFile := os.Getenv("SPRINGMASTER_TEST_RUN_SNAPSHOT_COUNT_FILE"); countFile != "" {
+		file, err := os.OpenFile(countFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			return "", fmt.Errorf("record test snapshot root: %w", err)
+		}
+		_, writeErr := io.WriteString(file, "snapshot-root\n")
+		closeErr := file.Close()
+		if writeErr != nil {
+			return "", fmt.Errorf("record test snapshot root: %w", writeErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("record test snapshot root: %w", closeErr)
+		}
 	}
 	remove = false
 	return canonical, nil
@@ -393,11 +444,230 @@ func cleanupPreparedSnapshot(prepared *preparedRepository, result *report.Reposi
 }
 
 type preparedRepository struct {
-	repository  workspace.Repository
-	snapshot    *snapshot.Snapshot
-	context     *semantic.Context
-	contentHash string
-	cacheKey    string
+	repository   workspace.Repository
+	snapshot     *snapshot.Snapshot
+	context      *semantic.Context
+	snapshotHash string
+	contentHash  string
+	cacheKey     string
+}
+
+type workspaceReplayRecord struct {
+	SchemaVersion     int                         `json:"schemaVersion"`
+	SourceFingerprint string                      `json:"sourceFingerprint"`
+	Repositories      []workspaceReplayRepository `json:"repositories"`
+}
+
+type workspaceReplayRepository struct {
+	ID           string `json:"id"`
+	ContentHash  string `json:"contentHash"`
+	AnalysisKey  string `json:"analysisKey"`
+	ResultSHA256 string `json:"resultSha256"`
+}
+
+func tryWorkspaceReplay(
+	ctx context.Context,
+	resultCache *cache.Store,
+	workerIdentity string,
+	resultFingerprint string,
+	options scanOptions,
+	repositories []workspace.Repository,
+	dependencyGraph *graph.Graph,
+) ([]report.Repository, bool) {
+	if options.mode != "STATIC_ONLY" {
+		return nil, false
+	}
+	sourceFingerprint, eligible := workspaceReplaySourceFingerprint(repositories, dependencyGraph)
+	if !eligible {
+		return nil, false
+	}
+	replayKey := workspaceReplayCacheKey(
+		workerIdentity, resultFingerprint, options.mode, sourceFingerprint)
+	rawRecord, found, err := resultCache.Get(ctx, replayKey)
+	if err != nil || !found {
+		return nil, false
+	}
+	var record workspaceReplayRecord
+	if err := json.Unmarshal(rawRecord, &record); err != nil ||
+		record.SchemaVersion != replaySchemaVersion ||
+		record.SourceFingerprint != sourceFingerprint ||
+		len(record.Repositories) != len(repositories) {
+		return nil, false
+	}
+	contentHashes, ok := collectReplayContent(ctx, repositories)
+	if !ok {
+		return nil, false
+	}
+	results := make([]report.Repository, len(repositories))
+	for index, repository := range repositories {
+		cachedRepository := record.Repositories[index]
+		if cachedRepository.ID != repository.ID ||
+			cachedRepository.AnalysisKey == "" ||
+			cachedRepository.ResultSHA256 == "" ||
+			cachedRepository.ContentHash != contentHashes[repository.ID] {
+			return nil, false
+		}
+		cached, found, err := resultCache.Get(ctx, cachedRepository.AnalysisKey)
+		if err != nil || !found {
+			return nil, false
+		}
+		if replayResultDigest(cached) != cachedRepository.ResultSHA256 {
+			return nil, false
+		}
+		findings, err := report.ExtractFindings(cached)
+		if err != nil {
+			return nil, false
+		}
+		results[index] = repositoryReport(repository)
+		results[index].Status = report.StatusCompleted
+		results[index].Result = cached
+		results[index].Findings = findings
+	}
+	for _, repository := range repositories {
+		if !workspace.ValidateReplayState(ctx, repository) {
+			return nil, false
+		}
+	}
+	return results, true
+}
+
+func storeWorkspaceReplay(
+	ctx context.Context,
+	resultCache *cache.Store,
+	workerIdentity string,
+	resultFingerprint string,
+	options scanOptions,
+	repositories []workspace.Repository,
+	dependencyGraph *graph.Graph,
+	prepared []preparedRepository,
+	results []report.Repository,
+) error {
+	if options.mode != "STATIC_ONLY" {
+		return nil
+	}
+	sourceFingerprint, eligible := workspaceReplaySourceFingerprint(repositories, dependencyGraph)
+	if !eligible || len(prepared) != len(repositories) || len(results) != len(repositories) {
+		return nil
+	}
+	contentHashes, ok := collectReplayContent(ctx, repositories)
+	if !ok {
+		return errors.New("source changed while indexing clean-workspace replay")
+	}
+	record := workspaceReplayRecord{
+		SchemaVersion:     replaySchemaVersion,
+		SourceFingerprint: sourceFingerprint,
+		Repositories:      make([]workspaceReplayRepository, len(repositories)),
+	}
+	for index, repository := range repositories {
+		if results[index].Status != report.StatusCompleted ||
+			results[index].Error != "" ||
+			prepared[index].cacheKey == "" ||
+			prepared[index].snapshotHash == "" ||
+			prepared[index].snapshotHash != contentHashes[repository.ID] {
+			return fmt.Errorf("repository %s no longer matches its analyzed snapshot", repository.ID)
+		}
+		cached, found, err := resultCache.Get(ctx, prepared[index].cacheKey)
+		if err != nil {
+			return fmt.Errorf("verify exact result for %s: %w", repository.ID, err)
+		}
+		if !found {
+			return fmt.Errorf("exact result for %s was not cached", repository.ID)
+		}
+		if _, err := report.ExtractFindings(cached); err != nil {
+			return nil
+		}
+		record.Repositories[index] = workspaceReplayRepository{
+			ID:           repository.ID,
+			ContentHash:  prepared[index].snapshotHash,
+			AnalysisKey:  prepared[index].cacheKey,
+			ResultSHA256: replayResultDigest(cached),
+		}
+	}
+	for _, repository := range repositories {
+		if !workspace.ValidateReplayState(ctx, repository) {
+			return fmt.Errorf("repository %s changed before replay index commit", repository.ID)
+		}
+	}
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return resultCache.Put(
+		ctx,
+		workspaceReplayCacheKey(
+			workerIdentity, resultFingerprint, options.mode, sourceFingerprint),
+		encoded,
+	)
+}
+
+func replayResultDigest(value json.RawMessage) string {
+	digest := sha256.Sum256(value)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func collectReplayContent(
+	ctx context.Context, repositories []workspace.Repository,
+) (map[string]string, bool) {
+	contentHashes := make(map[string]string, len(repositories))
+	budget := runSnapshotBudget{
+		maxFiles: maxRunSnapshotFiles,
+		maxBytes: maxRunSnapshotBytes,
+	}
+	for _, repository := range repositories {
+		if !repository.ReplayEligible || !workspace.ValidateReplayState(ctx, repository) {
+			return nil, false
+		}
+		fingerprint, err := snapshot.ContentDigest(ctx, repository.Path, snapshot.ContentOptions{})
+		if err != nil || fingerprint.ContentHash == "" ||
+			budget.add(fingerprint.FileCount, fingerprint.TotalBytes) != nil {
+			return nil, false
+		}
+		if !workspace.ValidateReplayState(ctx, repository) {
+			return nil, false
+		}
+		contentHashes[repository.ID] = fingerprint.ContentHash
+	}
+	return contentHashes, true
+}
+
+func workspaceReplaySourceFingerprint(
+	repositories []workspace.Repository, dependencyGraph *graph.Graph,
+) (string, bool) {
+	if len(repositories) == 0 || dependencyGraph == nil {
+		return "", false
+	}
+	for _, repository := range repositories {
+		if !repository.ReplayEligible || repository.ID == "" || repository.ContentHash == "" {
+			return "", false
+		}
+	}
+	encodedGraph, err := json.Marshal(dependencyGraph)
+	if err != nil {
+		return "", false
+	}
+	digest := sha256.New()
+	writeFingerprintField(digest, "format", replayFingerprintVersion)
+	for _, repository := range repositories {
+		writeFingerprintField(digest, "repository-id", repository.ID)
+		writeFingerprintField(digest, "repository-content", repository.ContentHash)
+	}
+	writeFingerprintField(digest, "dependency-graph", string(encodedGraph))
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil)), true
+}
+
+func workspaceReplayCacheKey(
+	workerIdentity, resultFingerprint, mode, sourceFingerprint string,
+) string {
+	return cache.Key(
+		fmt.Sprintf(
+			"workspace-replay-schema=%d\x00worker=%s",
+			replaySchemaVersion,
+			workerIdentity,
+		),
+		sourceFingerprint,
+		mode,
+		resultFingerprint,
+	)
 }
 
 func repositoryReport(repository workspace.Repository) report.Repository {
@@ -417,6 +687,7 @@ func assignSnapshotHashes(ctx context.Context, prepared []preparedRepository) (*
 		if prepared[index].snapshot == nil {
 			continue
 		}
+		prepared[index].snapshotHash = prepared[index].snapshot.ContentHash
 		prepared[index].contentHash = prepared[index].snapshot.ContentHash
 		inputs = append(inputs, graph.Repository{
 			ID:          prepared[index].repository.ID,

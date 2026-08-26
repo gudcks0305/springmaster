@@ -107,6 +107,32 @@ type Options struct {
 	MaxDepth      int
 }
 
+// ContentOptions controls an exact source-tree content fingerprint. Its
+// exclusions and safety limits have the same meaning and hard ceilings as
+// Options. ContentDigest does not need or create a destination directory.
+type ContentOptions struct {
+	// ExcludeNames are additional base names to skip anywhere in the tree.
+	// DefaultExcludedNames always apply.
+	ExcludeNames []string
+
+	// Zero uses the safe default. Positive values may lower, never raise, the
+	// package hard ceilings. MaxFiles counts all inspected filesystem entries.
+	MaxFiles      int
+	MaxFileBytes  int64
+	MaxTotalBytes int64
+	MaxDepth      int
+}
+
+// ContentFingerprint identifies exact source-tree contents without creating a
+// snapshot destination. ContentHash uses the same manifest format as
+// Snapshot.ContentHash, including regular-file bytes and safely rewritten
+// symlink targets.
+type ContentFingerprint struct {
+	ContentHash string
+	FileCount   int
+	TotalBytes  int64
+}
+
 // ManifestEntry describes one entry actually created in the snapshot. SHA256
 // is set for regular-file bytes and symlink target text; directories use an
 // empty hash. Paths are sorted, root-relative, and slash-separated.
@@ -146,6 +172,50 @@ type Snapshot struct {
 
 	mu      sync.Mutex
 	cleaned bool
+}
+
+// ContentDigest securely walks source and hashes exact regular-file bytes
+// without writing a destination tree. Exclusions, limits, symlink handling,
+// and source-mutation checks match Create. For the same stable source and
+// options, ContentHash, FileCount, and TotalBytes equal Create's results.
+func ContentDigest(ctx context.Context, source string, options ContentOptions) (ContentFingerprint, error) {
+	if err := contextError(ctx); err != nil {
+		return ContentFingerprint{}, err
+	}
+
+	sourceRoot, err := canonicalDirectory(source, "source")
+	if err != nil {
+		return ContentFingerprint{}, err
+	}
+	excluded, err := excludedNames(options.ExcludeNames)
+	if err != nil {
+		return ContentFingerprint{}, err
+	}
+	limits, err := normalizeLimits(Options{
+		MaxFiles:      options.MaxFiles,
+		MaxFileBytes:  options.MaxFileBytes,
+		MaxTotalBytes: options.MaxTotalBytes,
+		MaxDepth:      options.MaxDepth,
+	})
+	if err != nil {
+		return ContentFingerprint{}, err
+	}
+
+	state := copyState{limits: limits}
+	if err := secureContentTree(ctx, sourceRoot, excluded, &state); err != nil {
+		return ContentFingerprint{}, err
+	}
+	sort.Slice(state.manifest, func(i, j int) bool {
+		if state.manifest[i].Path == state.manifest[j].Path {
+			return state.manifest[i].Kind < state.manifest[j].Kind
+		}
+		return state.manifest[i].Path < state.manifest[j].Path
+	})
+	return ContentFingerprint{
+		ContentHash: manifestHash(state.manifest),
+		FileCount:   state.entries,
+		TotalBytes:  state.totalBytes,
+	}, nil
 }
 
 // Create copies source into a fresh directory below options.DestinationDir.

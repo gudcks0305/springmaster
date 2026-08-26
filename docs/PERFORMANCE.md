@@ -29,6 +29,10 @@ alongside wall times when results are kept outside this repository.
   cache-miss work and any worker/JVM startup cost exposed by the invocation.
 - **Warm:** the same private cache directory is reused for all iterations in a
   phase. The first iteration populates it; later iterations show hit behavior.
+  A fully clean, tracked `STATIC_ONLY` workspace can use exact replay: source bytes are read
+  once for secure digest verification, but no snapshot bytes are written and no
+  Java worker or source index is started. The CLI prints `cache replay:` on this
+  path.
 - **Workers:** `--workers N` controls the bounded Java worker pool. Keep master
   root, repository contents, mode, jar, and iteration count fixed when comparing
   worker values.
@@ -88,6 +92,13 @@ repositories:
 Do not benchmark a repository while another process is writing it. A changing
 worktree changes its content hash and makes both cache and timing comparisons
 ambiguous.
+
+Replay is deliberately conservative, `STATIC_ONLY`, and workspace-wide. Relevant dirty,
+staged, untracked, or ignored content, Git attributes/submodules, sparse
+checkout, line-ending conversion, special index flags, an analyzer/config/mode
+change, a missing exact entry, or any secure digest mismatch falls back to the
+existing snapshot pipeline. Consequently a warm dirty-worktree benchmark still
+measures snapshot creation before its ordinary result-cache lookup.
 
 ## Interpreting results
 
