@@ -365,15 +365,6 @@ public class StaticPracticeFindingAnalyzer {
                                 "ApplicationRunner",
                                 "InitializingBean",
                                 "SmartLifecycle"));
-        Set<String> transactionalMethods =
-                declaration.getMethods().stream()
-                        .filter(
-                                method ->
-                                        hasAnnotation(method.getAnnotations(), "Transactional")
-                                                || classTransactional)
-                        .map(MethodDeclaration::getNameAsString)
-                        .collect(Collectors.toSet());
-
         if (!outboundEndpoints.isEmpty()) {
             detectHttpClientGaps(relativePath, fileContent, outboundEndpoints, findings);
         }
@@ -532,7 +523,6 @@ public class StaticPracticeFindingAnalyzer {
                         relativePath,
                         declaration,
                         method,
-                        transactionalMethods,
                         repositoryLike,
                         legacyTransactionalVisibility,
                         signals,
@@ -3373,7 +3363,6 @@ public class StaticPracticeFindingAnalyzer {
             String relativePath,
             ClassOrInterfaceDeclaration declaration,
             MethodDeclaration method,
-            Set<String> transactionalMethods,
             boolean repositoryLike,
             boolean legacyTransactionalVisibility,
             MethodSignals signals,
@@ -3536,75 +3525,87 @@ public class StaticPracticeFindingAnalyzer {
                                 .build());
             }
         }
-        if (!transactionalMethods.isEmpty()) {
-            method.findAll(MethodCallExpr.class)
-                    .forEach(
-                            call -> {
-                                if (!transactionalMethods.contains(call.getNameAsString())) {
-                                    return;
-                                }
-                                // Only an unqualified call (foo()) or an explicit this.foo() is a
-                                // genuine self-invocation. A call qualified by any other receiver
-                                // (collaborator.foo()) targets a different bean, even when it
-                                // happens to share a method name with a local @Transactional
-                                // method.
-                                var scope = call.getScope().orElse(null);
-                                if (scope != null && !(scope instanceof ThisExpr)) {
-                                    return;
-                                }
-                                findings.add(
-                                        FindingFactory.builder(
-                                                        FindingRules
-                                                                .SPRING_TRANSACTIONAL_SELF_INVOCATION,
-                                                        FindingConfidence.MEDIUM)
-                                                .shortMessage(
-                                                        "Transactional method appears to be called"
-                                                                + " from the same class: "
-                                                                + declaration.getNameAsString()
-                                                                + "#"
-                                                                + call.getNameAsString())
-                                                .whyBadPractice(
-                                                        "Self-invocation bypasses the usual Spring"
-                                                            + " proxy boundary, so the callee may"
-                                                            + " not receive the transaction"
-                                                            + " semantics its annotation suggests.")
-                                                .possibleImpact(
-                                                        "Code may appear transactional in reviews"
+        AnnotationExpr callerTransaction = effectiveTransactionalAnnotation(declaration, method);
+        boolean callerHasActiveTransaction =
+                callerTransactionGuaranteesActiveTransaction(
+                        declaration, method, callerTransaction, legacyTransactionalVisibility);
+        method.findAll(MethodCallExpr.class)
+                .forEach(
+                        call -> {
+                            // Do not attribute calls declared inside a local/anonymous type back to
+                            // the enclosing service method.
+                            if (call.findAncestor(MethodDeclaration.class)
+                                    .filter(method::equals)
+                                    .isEmpty()) {
+                                return;
+                            }
+                            var scope = call.getScope().orElse(null);
+                            if (scope != null && !(scope instanceof ThisExpr)) {
+                                return;
+                            }
+                            TransactionalSelfInvocationTarget target =
+                                    resolveTransactionalSelfInvocationTarget(
+                                            declaration,
+                                            method,
+                                            call,
+                                            legacyTransactionalVisibility);
+                            if (target == null
+                                    || !transactionalProxyChangesContext(
+                                            callerTransaction,
+                                            callerHasActiveTransaction,
+                                            target.annotation())) {
+                                return;
+                            }
+                            findings.add(
+                                    FindingFactory.builder(
+                                                    FindingRules
+                                                            .SPRING_TRANSACTIONAL_SELF_INVOCATION,
+                                                    FindingConfidence.MEDIUM)
+                                            .shortMessage(
+                                                    "Transactional method appears to be called"
+                                                            + " from the same class: "
+                                                            + declaration.getNameAsString()
+                                                            + "#"
+                                                            + target.method().getNameAsString())
+                                            .whyBadPractice(
+                                                    "Self-invocation bypasses the usual Spring"
+                                                        + " proxy boundary, so the callee may not"
+                                                        + " receive the transaction semantics its"
+                                                        + " annotation suggests.")
+                                            .possibleImpact(
+                                                    "Code may appear transactional in reviews"
                                                             + " while still executing without the"
                                                             + " expected rollback or propagation"
                                                             + " behavior at runtime.")
-                                                .recommendation(
-                                                        "Call the transactional method through"
-                                                            + " another Spring bean or move the"
-                                                            + " transaction boundary to the public"
-                                                            + " entry point that is invoked"
-                                                            + " externally.")
-                                                .evidence(
-                                                        "Method "
-                                                                + method.getNameAsString()
-                                                                + " calls "
-                                                                + call
-                                                                + " inside "
-                                                                + relativePath
-                                                                + ".")
-                                                .limitations(
-                                                        "Static analysis cannot prove whether the"
-                                                            + " call path is routed through a proxy"
-                                                            + " by another mechanism, but"
-                                                            + " same-class invocation is a common"
-                                                            + " transactional pitfall.")
-                                                .source(
-                                                        relativePath,
-                                                        call.getBegin()
-                                                                .map(position -> position.line)
-                                                                .orElse(line))
-                                                .target(
-                                                        declaration.getNameAsString()
-                                                                + "#"
-                                                                + call.getNameAsString())
-                                                .build());
-                            });
-        }
+                                            .recommendation(
+                                                    "Call the transactional method through another"
+                                                        + " Spring bean or move the transaction"
+                                                        + " boundary to the public entry point that"
+                                                        + " is invoked externally.")
+                                            .evidence(
+                                                    "Method "
+                                                            + method.getNameAsString()
+                                                            + " calls "
+                                                            + call
+                                                            + " inside "
+                                                            + relativePath
+                                                            + ".")
+                                            .limitations(
+                                                    "The target is matched conservatively by local"
+                                                        + " method name and arity without full type"
+                                                        + " resolution. AspectJ weaving can also"
+                                                        + " advise same-class calls.")
+                                            .source(
+                                                    relativePath,
+                                                    call.getBegin()
+                                                            .map(position -> position.line)
+                                                            .orElse(line))
+                                            .target(
+                                                    declaration.getNameAsString()
+                                                            + "#"
+                                                            + target.method().getNameAsString())
+                                            .build());
+                        });
         if (method.isPrivate()) {
             return;
         }
@@ -3846,6 +3847,165 @@ public class StaticPracticeFindingAnalyzer {
                             .target(declaration.getNameAsString() + "#" + method.getNameAsString())
                             .build());
         }
+    }
+
+    private TransactionalSelfInvocationTarget resolveTransactionalSelfInvocationTarget(
+            ClassOrInterfaceDeclaration declaration,
+            MethodDeclaration caller,
+            MethodCallExpr call,
+            boolean legacyTransactionalVisibility) {
+        List<MethodDeclaration> candidates =
+                declaration.getMethodsByName(call.getNameAsString()).stream()
+                        .filter(candidate -> invocationArityMatches(candidate, call))
+                        .toList();
+        // Without symbol solving, same-arity overloads cannot be resolved reliably. Prefer a
+        // missed finding over assigning the annotation from the wrong overload.
+        if (candidates.size() != 1) {
+            return null;
+        }
+        MethodDeclaration candidate = candidates.getFirst();
+        if (candidate == caller
+                || !isEligibleTransactionalProxyMethod(
+                        declaration, candidate, legacyTransactionalVisibility)) {
+            return null;
+        }
+        AnnotationExpr annotation = effectiveTransactionalAnnotation(declaration, candidate);
+        return annotation == null
+                ? null
+                : new TransactionalSelfInvocationTarget(candidate, annotation);
+    }
+
+    private boolean invocationArityMatches(MethodDeclaration method, MethodCallExpr call) {
+        int parameterCount = method.getParameters().size();
+        int argumentCount = call.getArguments().size();
+        if (parameterCount > 0 && method.getParameter(parameterCount - 1).isVarArgs()) {
+            return argumentCount >= parameterCount - 1;
+        }
+        return argumentCount == parameterCount;
+    }
+
+    private boolean isEligibleTransactionalProxyMethod(
+            ClassOrInterfaceDeclaration declaration,
+            MethodDeclaration method,
+            boolean legacyTransactionalVisibility) {
+        if (method.isPrivate() || method.isStatic() || method.isFinal()) {
+            return false;
+        }
+        return !legacyTransactionalVisibility || declaration.isInterface() || method.isPublic();
+    }
+
+    private AnnotationExpr effectiveTransactionalAnnotation(
+            ClassOrInterfaceDeclaration declaration, MethodDeclaration method) {
+        AnnotationExpr methodAnnotation = transactionalAnnotation(method.getAnnotations());
+        return methodAnnotation != null
+                ? methodAnnotation
+                : transactionalAnnotation(declaration.getAnnotations());
+    }
+
+    private AnnotationExpr transactionalAnnotation(NodeList<AnnotationExpr> annotations) {
+        return annotations.stream()
+                .filter(
+                        candidate ->
+                                "Transactional".equals(simpleName(candidate.getNameAsString())))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private boolean callerTransactionGuaranteesActiveTransaction(
+            ClassOrInterfaceDeclaration declaration,
+            MethodDeclaration method,
+            AnnotationExpr annotation,
+            boolean legacyTransactionalVisibility) {
+        if (annotation == null) {
+            return false;
+        }
+        boolean methodOverride = transactionalAnnotation(method.getAnnotations()) != null;
+        if (methodOverride
+                && !isEligibleTransactionalProxyMethod(
+                        declaration, method, legacyTransactionalVisibility)) {
+            return false;
+        }
+        String propagation = transactionalPropagation(annotation);
+        return Set.of("REQUIRED", "REQUIRES_NEW", "NESTED", "MANDATORY").contains(propagation);
+    }
+
+    private boolean transactionalProxyChangesContext(
+            AnnotationExpr callerAnnotation,
+            boolean callerHasActiveTransaction,
+            AnnotationExpr targetAnnotation) {
+        String targetPropagation = transactionalPropagation(targetAnnotation);
+        if (targetPropagation == null) {
+            return false;
+        }
+        if (!callerHasActiveTransaction) {
+            return Set.of("REQUIRED", "REQUIRES_NEW", "NESTED", "MANDATORY")
+                    .contains(targetPropagation);
+        }
+        if (Set.of("REQUIRES_NEW", "NESTED", "NOT_SUPPORTED", "NEVER")
+                .contains(targetPropagation)) {
+            return true;
+        }
+        if (transactionalAnnotationsEquivalent(callerAnnotation, targetAnnotation)) {
+            return false;
+        }
+        return hasDistinctTransactionalInterceptorSemantics(targetAnnotation);
+    }
+
+    private String transactionalPropagation(AnnotationExpr annotation) {
+        if (annotation == null || !annotation.isNormalAnnotationExpr()) {
+            return annotation == null ? null : "REQUIRED";
+        }
+        return annotation.asNormalAnnotationExpr().getPairs().stream()
+                .filter(pair -> "propagation".equals(pair.getNameAsString()))
+                .map(pair -> simpleName(pair.getValue().toString()))
+                .findFirst()
+                .orElse("REQUIRED");
+    }
+
+    private boolean transactionalAnnotationsEquivalent(
+            AnnotationExpr callerAnnotation, AnnotationExpr targetAnnotation) {
+        return callerAnnotation != null
+                && callerAnnotation.toString().equals(targetAnnotation.toString());
+    }
+
+    private boolean hasDistinctTransactionalInterceptorSemantics(AnnotationExpr annotation) {
+        if (annotation.isMarkerAnnotationExpr()) {
+            return false;
+        }
+        // @Transactional("orders") selects a transaction manager and therefore needs its own
+        // interceptor even when the caller already has a transaction.
+        if (annotation.isSingleMemberAnnotationExpr()) {
+            Expression value = annotation.asSingleMemberAnnotationExpr().getMemberValue();
+            return !(value instanceof LiteralStringValueExpr literal
+                    && literal.getValue().isBlank());
+        }
+        return annotation.asNormalAnnotationExpr().getPairs().stream()
+                .anyMatch(
+                        pair -> {
+                            String member = pair.getNameAsString();
+                            if (Set.of("value", "transactionManager").contains(member)) {
+                                return !(pair.getValue() instanceof LiteralStringValueExpr literal
+                                        && literal.getValue().isBlank());
+                            }
+                            if (Set.of(
+                                            "rollbackFor",
+                                            "rollbackForClassName",
+                                            "noRollbackFor",
+                                            "noRollbackForClassName")
+                                    .contains(member)) {
+                                return !pair.getValue().isArrayInitializerExpr()
+                                        || !pair.getValue()
+                                                .asArrayInitializerExpr()
+                                                .getValues()
+                                                .isEmpty();
+                            }
+                            if (!"propagation".equals(member)) {
+                                return false;
+                            }
+                            String propagation = simpleName(pair.getValue().toString());
+                            return Set.of("REQUIRES_NEW", "NESTED", "NOT_SUPPORTED", "NEVER")
+                                    .contains(propagation);
+                        });
     }
 
     private CatchAnalysis analyzeCatchBody(BlockStmt body, String variableName) {
@@ -5895,6 +6055,9 @@ public class StaticPracticeFindingAnalyzer {
         }
         return List.copyOf(deduped.values());
     }
+
+    private record TransactionalSelfInvocationTarget(
+            MethodDeclaration method, AnnotationExpr annotation) {}
 
     private record MethodSignals(
             boolean httpCalls,

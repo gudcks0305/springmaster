@@ -1045,9 +1045,8 @@ public final class FindingRules {
                     FindingCategory.TRANSACTION,
                     FindingRuntimeDetection.NOT_NORMALLY_DETECTED);
 
-    /** A {@code @Transactional}-annotated method is called directly (without an external
-     *  receiver) from within the same class. The call bypasses Spring's AOP proxy, so the
-     *  transaction semantics declared on the target method are ignored. */
+    /** An eligible transactional method is called directly from the same class where crossing the
+     *  Spring AOP proxy would visibly change transaction context or interceptor semantics. */
     public static final FindingRule SPRING_TRANSACTIONAL_SELF_INVOCATION =
             rule(
                     "SPRING_TRANSACTIONAL_SELF_INVOCATION",
