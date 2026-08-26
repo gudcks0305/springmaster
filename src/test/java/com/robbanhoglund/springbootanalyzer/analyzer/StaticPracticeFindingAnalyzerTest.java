@@ -901,6 +901,192 @@ record CreateRequest(@NotBlank String symbol, int quantity) {
     }
 
     @Test
+    void doesNotFlagClassLevelTransactionalPrivateCallerToPublicHelper() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("ExcelService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                @Transactional
+                class ExcelService {
+                    private String buildHeader() {
+                        return cutDecimal();
+                    }
+
+                    public String cutDecimal() {
+                        return "0.00";
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
+    }
+
+    @Test
+    void doesNotFlagLegacyClassLevelTransactionalPackageCallerToPublicHelper() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("ExcelService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                @Transactional
+                class ExcelService {
+                    @Transactional(readOnly = true)
+                    String buildHeader() {
+                        return cutDecimal();
+                    }
+
+                    public String cutDecimal() {
+                        return "0.00";
+                    }
+                }
+                """);
+
+        BuildInfo bootTwoBuild =
+                new BuildInfo(
+                        BuildTool.GRADLE,
+                        true,
+                        "17",
+                        List.of(),
+                        "2.7.18",
+                        "build.gradle plugin",
+                        "HIGH");
+        List<Finding> findings = analyzeStaticPractice(tempDir, bootTwoBuild);
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
+    }
+
+    @Test
+    void flagsRequiresNewSelfInvocationFromClassLevelTransactionalPrivateCaller()
+            throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                @Transactional
+                class OrderService {
+                    private void handle() {
+                        saveAudit();
+                    }
+
+                    @Transactional(propagation = Propagation.REQUIRES_NEW)
+                    public void saveAudit() {}
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
+    }
+
+    @Test
+    void doesNotFlagEquivalentNotSupportedClassLevelHelperCall() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("ExcelService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                @Transactional(propagation = Propagation.NOT_SUPPORTED)
+                class ExcelService {
+                    private String buildHeader() {
+                        return cutDecimal();
+                    }
+
+                    public String cutDecimal() {
+                        return "0.00";
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
+    }
+
+    @Test
+    void flagsMandatorySelfInvocationFromLegacyNonPublicCaller() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    @Transactional
+                    void handle() {
+                        save();
+                    }
+
+                    @Transactional(propagation = Propagation.MANDATORY)
+                    public void save() {}
+                }
+                """);
+
+        BuildInfo bootTwoBuild =
+                new BuildInfo(
+                        BuildTool.GRADLE,
+                        true,
+                        "17",
+                        List.of(),
+                        "2.7.18",
+                        "build.gradle plugin",
+                        "HIGH");
+        List<Finding> findings = analyzeStaticPractice(tempDir, bootTwoBuild);
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
+    }
+
+    @Test
     void respectsValidRequestBodyAnnotations() throws IOException {
         Files.createDirectories(tempDir.resolve("src/main/resources"));
         Path sourceRoot =

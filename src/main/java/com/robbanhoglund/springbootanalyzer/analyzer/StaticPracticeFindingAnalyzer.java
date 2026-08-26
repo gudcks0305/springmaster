@@ -4567,25 +4567,40 @@ public class StaticPracticeFindingAnalyzer {
         if (targetPropagation == null) {
             return false;
         }
+        // These semantics always require crossing the proxy, even when caller and target declare
+        // the same annotation (for example, REQUIRES_NEW must open another transaction).
+        if (Set.of("REQUIRES_NEW", "NESTED").contains(targetPropagation)) {
+            return true;
+        }
+        // Class-level @Transactional applies the same metadata to ordinary public helpers. When a
+        // private caller (or a package-visible caller on Spring 5) reaches such a helper, caller
+        // visibility alone must not turn an equivalent REQUIRED boundary into self-invocation.
+        if (transactionalAnnotationsEquivalent(callerAnnotation, targetAnnotation)) {
+            return false;
+        }
+        // Suspending an active transaction or enforcing that none exists also depends on the
+        // proxy, but an identical class-level NOT_SUPPORTED/NEVER annotation was handled above.
+        if (Set.of("NOT_SUPPORTED", "NEVER").contains(targetPropagation)) {
+            return true;
+        }
         if (!callerHasActiveTransaction) {
+            // MANDATORY's missing-transaction check is itself interceptor behavior. Without an
+            // active caller, a same-class call silently bypasses that contract.
+            if ("MANDATORY".equals(targetPropagation)) {
+                return true;
+            }
             // An unannotated entry point may itself be called inside an outer transaction. A plain
             // REQUIRED callee would simply join it, so reporting that common shape creates far more
             // noise than signal. Keep only semantics that materially require proxy interception.
-            if (callerAnnotation == null) {
-                return Set.of("REQUIRES_NEW", "NESTED", "NOT_SUPPORTED", "NEVER")
-                                .contains(targetPropagation)
-                        || hasDistinctTransactionalInterceptorSemantics(targetAnnotation);
+            if (callerAnnotation == null
+                    || transactionalAnnotationOpensActiveBoundary(callerAnnotation)) {
+                return hasDistinctTransactionalInterceptorSemantics(targetAnnotation);
             }
-            return Set.of("REQUIRED", "REQUIRES_NEW", "NESTED", "MANDATORY")
-                            .contains(targetPropagation)
+            // SUPPORTS, NOT_SUPPORTED, and NEVER do not guarantee an active transaction. A
+            // same-class REQUIRED or MANDATORY target therefore still materially depends on the
+            // missing proxy hop.
+            return "REQUIRED".equals(targetPropagation)
                     || hasDistinctTransactionalInterceptorSemantics(targetAnnotation);
-        }
-        if (Set.of("REQUIRES_NEW", "NESTED", "NOT_SUPPORTED", "NEVER")
-                .contains(targetPropagation)) {
-            return true;
-        }
-        if (transactionalAnnotationsEquivalent(callerAnnotation, targetAnnotation)) {
-            return false;
         }
         return hasDistinctTransactionalInterceptorSemantics(targetAnnotation);
     }
