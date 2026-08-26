@@ -481,11 +481,9 @@ public final class FindingRules {
                     FindingCategory.MAINTAINABILITY,
                     FindingRuntimeDetection.NOT_NORMALLY_DETECTED);
 
-    /** A Spring Data {@code @Modifying} query method has no {@code @Transactional} on the method
-     *  or its class. Executing the modifying query without ANY active transaction throws
-     *  {@code jakarta.persistence.TransactionRequiredException} — but the boundary is commonly
-     *  (and correctly) provided by a {@code @Transactional} service-layer caller, which static
-     *  per-file analysis cannot see. Verify a transactional caller exists. */
+    /** A Spring Data {@code @Modifying} query method has no local transaction annotation and no
+     *  source-resolved transactional or programmatic caller. Unknown or ambiguous call paths are
+     *  suppressed rather than treated as proof that a transaction is absent. */
     public static final FindingRule SPRING_MODIFYING_NO_TRANSACTION =
             rule(
                     "SPRING_MODIFYING_NO_TRANSACTION",
@@ -910,10 +908,9 @@ public final class FindingRules {
                     FindingCategory.CACHING,
                     FindingRuntimeDetection.NOT_NORMALLY_DETECTED);
 
-    /** {@code @Cacheable} or {@code @CachePut} returns a mutable collection type
-     *  ({@code List}, {@code Map}, {@code Set}, etc.). Callers that mutate the returned
-     *  collection are directly mutating the cached instance, causing subsequent cache hits to
-     *  return corrupt data. */
+    /** {@code @Cacheable} or {@code @CachePut} returns a mutable collection while source-visible
+     *  configuration proves an in-process reference-store cache manager. Serialized,
+     *  store-by-value, selected, unknown, or ambiguous providers are suppressed. */
     public static final FindingRule SPRING_CACHEABLE_MUTABLE_RETURN_TYPE =
             rule(
                     "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE",
@@ -1009,10 +1006,9 @@ public final class FindingRules {
                     FindingCategory.TRANSACTION,
                     FindingRuntimeDetection.NOT_NORMALLY_DETECTED);
 
-    /** A {@code @Transactional(readOnly = true)} method (or a method inheriting a class-level
-     *  read-only transaction) performs persistence writes. Read-only transactions set the
-     *  Hibernate flush mode to MANUAL, so dirty-checked updates are never flushed — the writes are
-     *  silently lost (or fail late on a read-only connection). */
+    /** A proxy-eligible, guaranteed-active {@code @Transactional(readOnly = true)} boundary
+     *  performs a source-resolved persistence write in the same transaction. Deferred callbacks
+     *  and proven independent boundaries are excluded. */
     public static final FindingRule SPRING_TRANSACTIONAL_READONLY_WITH_WRITES =
             rule(
                     "SPRING_TRANSACTIONAL_READONLY_WITH_WRITES",
@@ -1033,10 +1029,9 @@ public final class FindingRules {
                     FindingCategory.TRANSACTION,
                     FindingRuntimeDetection.NOT_NORMALLY_DETECTED);
 
-    /** A {@code @Transactional} method declares a checked exception in its {@code throws} clause
-     *  but the annotation has no {@code rollbackFor}. Spring rolls back only on
-     *  {@code RuntimeException}/{@code Error} by default, so a thrown checked exception commits the
-     *  partial transaction. */
+    /** A proxy-eligible active transaction has a straight-line, source-resolved persistence write
+     *  followed by an explicit escaping exception proven checked, without a matching visible
+     *  rollback rule. */
     public static final FindingRule SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK =
             rule(
                     "SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK",
@@ -1241,13 +1236,13 @@ public final class FindingRules {
                     FindingCategory.OBSERVABILITY,
                     FindingRuntimeDetection.NOT_NORMALLY_DETECTED);
 
-    /** A {@code @Transactional} method contains a catch block that catches {@code RuntimeException}
-     *  or {@code Exception} without rethrowing, which silently prevents Spring from triggering
-     *  an automatic rollback, leaving the database in a potentially inconsistent state. */
+    /** A guaranteed-active transaction catches a sole source-resolved participating transactional
+     *  collaborator failure and then performs a direct recovery write in the same doomed
+     *  transaction. */
     public static final FindingRule SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED =
             rule(
                     "SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED",
-                    "@Transactional method swallows exception, preventing rollback",
+                    "Caught transactional failure followed by same-transaction recovery write",
                     FindingSeverity.WARNING,
                     FindingCategory.TRANSACTION,
                     FindingRuntimeDetection.NOT_NORMALLY_DETECTED);
@@ -1755,10 +1750,9 @@ public final class FindingRules {
 
     // ── Resource exhaustion / startup (Tier D) ────────────────────────────────
 
-    /** An unbounded {@code repository.findAll()} (no {@code Pageable}/{@code Sort}/{@code Example}
-     *  argument) is called from a {@code @Service}, {@code @Component}, {@code @Controller}, or
-     *  {@code @RestController}. On a large table this loads every row into memory at once,
-     *  risking {@code OutOfMemoryError} and long GC pauses. */
+    /** An unbounded {@code findAll()} resolves to a locally declared Spring Data repository and is
+     *  called from a mapped runtime callback, runner, or loop. General service methods, ambiguous
+     *  types, and clearly bounded code/config/reference repositories are suppressed. */
     public static final FindingRule SPRING_UNBOUNDED_FINDALL =
             rule(
                     "SPRING_UNBOUNDED_FINDALL",

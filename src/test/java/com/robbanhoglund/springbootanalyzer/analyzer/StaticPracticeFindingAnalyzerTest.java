@@ -590,6 +590,38 @@ record CreateRequest(@NotBlank String symbol, int quantity) {
                 package com.example.demo;
 
                 import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    public void handle() {
+                        save();
+                    }
+
+                    @Transactional(propagation = Propagation.REQUIRES_NEW)
+                    public void save() {}
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
+    }
+
+    @Test
+    void doesNotFlagPlainRequiredSelfInvocationFromUnannotatedCaller() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
                 import org.springframework.transaction.annotation.Transactional;
 
                 @Service
@@ -607,7 +639,7 @@ record CreateRequest(@NotBlank String symbol, int quantity) {
 
         assertThat(findings)
                 .extracting(Finding::ruleId)
-                .contains(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_SELF_INVOCATION.ruleId());
     }
 
     @Test
@@ -1544,6 +1576,7 @@ class PriceRefreshJob {
                 package com.example.demo;
 
                 import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
                 import org.springframework.transaction.annotation.Transactional;
 
                 @Service
@@ -1567,7 +1600,7 @@ class PriceRefreshJob {
                         orderRepository.save(new Object());
                     }
 
-                    @Transactional
+                    @Transactional(propagation = Propagation.REQUIRES_NEW)
                     public void persistBatch() {
                         orderRepository.save(new Object());
                     }
@@ -2476,6 +2509,425 @@ class PriceRefreshJob {
                                         && "OrderRepositoryImpl#updateStatus"
                                                 .equals(finding.target())
                                         && finding.primaryLocation() != null);
+    }
+
+    @Test
+    void doesNotFlagModifyingQueryCalledByTransactionalManager() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+                import org.springframework.data.jpa.repository.Query;
+
+                interface OrderRepository {
+                    @Modifying
+                    @Query("update Order o set o.status = :status")
+                    void updateStatus(String status);
+                }
+                """);
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderRepository orderRepository = null;
+
+                    @Transactional
+                    void complete() {
+                        orderRepository.updateStatus("DONE");
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
+    }
+
+    @Test
+    void doesNotFlagModifyingQueryCalledInsideTransactionTemplate() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+                import org.springframework.data.jpa.repository.Query;
+
+                interface OrderRepository {
+                    @Modifying
+                    @Query("delete from Order o where o.expired = true")
+                    int deleteExpired();
+                }
+                """);
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.support.TransactionTemplate;
+
+                @Service
+                class OrderManager {
+                    private final TransactionTemplate transactions = null;
+                    private final OrderRepository orderRepository = null;
+
+                    void cleanup() {
+                        transactions.execute(status -> orderRepository.deleteExpired());
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
+    }
+
+    @Test
+    void doesNotFlagModifyingQueryReachedThroughPrivateHelperClosure() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                interface OrderRepository {
+                    @Modifying
+                    int deleteExpired();
+                }
+                """);
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void cleanup() {
+                        deleteExpired();
+                    }
+
+                    private void deleteExpired() {
+                        repository.deleteExpired();
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
+    }
+
+    @Test
+    void doesNotFlagModifyingQueryReachedThroughTransactionTemplateHelperClosure()
+            throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                interface OrderRepository {
+                    @Modifying
+                    int deleteExpired();
+                }
+                """);
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.support.TransactionTemplate;
+
+                @Service
+                class OrderManager {
+                    private final TransactionTemplate transactions = null;
+                    private final OrderRepository repository = null;
+
+                    void cleanup() {
+                        transactions.execute(status -> deleteExpired());
+                    }
+
+                    private int deleteExpired() {
+                        return repository.deleteExpired();
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
+    }
+
+    @Test
+    void flagsModifyingQueryWhenOnlyCallerUsesSupportsPropagation() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                interface OrderRepository {
+                    @Modifying
+                    int deleteExpired();
+                }
+                """);
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderRepository repository = null;
+
+                    @Transactional(propagation = Propagation.SUPPORTS)
+                    void cleanup() {
+                        repository.deleteExpired();
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
+    }
+
+    @Test
+    void flagsModifyingQueryWhenOnlyTransactionalCallerIsPrivateAndNotProxyEligible()
+            throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                interface OrderRepository {
+                    @Modifying
+                    int deleteExpired();
+                }
+                """);
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    private void cleanup() {
+                        repository.deleteExpired();
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
+    }
+
+    @Test
+    void keepsSameSimpleNameRepositoryCallersSeparatedByQualifiedOwner() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path firstPackage =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/first"));
+        Path secondPackage =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/second"));
+        Files.writeString(
+                firstPackage.resolve("OrderRepository.java"),
+                """
+                package com.example.first;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                public interface OrderRepository {
+                    @Modifying
+                    int updateStatus(String status);
+                }
+                """);
+        Files.writeString(
+                secondPackage.resolve("OrderRepository.java"),
+                """
+                package com.example.second;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                public interface OrderRepository {
+                    @Modifying
+                    int updateStatus(String status);
+                }
+                """);
+        Files.writeString(
+                firstPackage.resolve("OrderManager.java"),
+                """
+                package com.example.first;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void update() {
+                        repository.updateStatus("DONE");
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .filteredOn(
+                        finding ->
+                                FindingRules.SPRING_MODIFYING_NO_TRANSACTION
+                                        .ruleId()
+                                        .equals(finding.ruleId()))
+                .singleElement()
+                .satisfies(
+                        finding ->
+                                assertThat(finding.sourceFile())
+                                        .contains("com/example/second/OrderRepository.java"));
+    }
+
+    @Test
+    void suppressesModifyingFindingForSameArityOverloadsWithoutArgumentTypeResolution()
+            throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                interface OrderRepository {
+                    @Modifying
+                    int updateStatus(String status);
+
+                    @Modifying
+                    int updateStatus(long statusCode);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
+    }
+
+    @Test
+    void doesNotUseTransactionBoundaryFromDifferentExecutedCallbackParameter() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderRepository.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.data.jpa.repository.Modifying;
+
+                interface OrderRepository {
+                    @Modifying
+                    int deleteExpired();
+                }
+                """);
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import java.util.function.Supplier;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final MultiCallbackExecutor transactions = null;
+                    private final OrderRepository repository = null;
+
+                    void cleanup() {
+                        transactions.execute(() -> repository.deleteExpired(), () -> {});
+                    }
+                }
+
+                class MultiCallbackExecutor {
+                    @Transactional
+                    <T> T execute(Supplier<T> work, Runnable cleanup) {
+                        cleanup.run();
+                        return null;
+                    }
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_MODIFYING_NO_TRANSACTION.ruleId());
     }
 
     @Test
@@ -5564,6 +6016,266 @@ interface InventoryClient {
     }
 
     @Test
+    void doesNotFlagReadOnlyWritesRoutedThroughTenantTransactionExecutor() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("TenantService.java"),
+                """
+                package com.example.demo;
+
+                import java.util.function.Supplier;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class TenantService {
+                    private final TenantTransactionExecutor transactions = null;
+                    private final OrderRepository repository = null;
+                    private final DraftStore drafts = null;
+
+                    @Transactional(readOnly = true)
+                    void refresh(Order order) {
+                        drafts.save(order);
+                        transactions.execute(() -> repository.save(order));
+                    }
+                }
+
+                class TenantTransactionExecutor {
+                    @Transactional(propagation = Propagation.REQUIRES_NEW)
+                    <T> T execute(Supplier<T> work) {
+                        return work.get();
+                    }
+                }
+
+                interface OrderRepository {
+                    Order save(Order order);
+                }
+
+                interface DraftStore {
+                    Order save(Order order);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_READONLY_WITH_WRITES.ruleId());
+    }
+
+    @Test
+    void flagsReadOnlyWriteInsideDefaultTransactionTemplateCallback() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+                import org.springframework.transaction.support.TransactionTemplate;
+
+                @Service
+                class OrderService {
+                    private final TransactionTemplate transactions = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional(readOnly = true)
+                    void update(Order order) {
+                        transactions.execute(status -> repository.save(order));
+                    }
+                }
+
+                interface OrderRepository {
+                    Order save(Order order);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_TRANSACTIONAL_READONLY_WITH_WRITES.ruleId());
+    }
+
+    @Test
+    void flagsReadOnlyWriteInsideVisibleImmediateCustomExecutorWithoutRequiresNew()
+            throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import java.util.function.Supplier;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final TenantTransactionExecutor transactions = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional(readOnly = true)
+                    void update(Order order) {
+                        transactions.execute(() -> repository.save(order));
+                    }
+                }
+
+                class TenantTransactionExecutor {
+                    <T> T execute(Supplier<T> work) {
+                        return work.get();
+                    }
+                }
+
+                interface OrderRepository {
+                    Order save(Order order);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_TRANSACTIONAL_READONLY_WITH_WRITES.ruleId());
+    }
+
+    @Test
+    void doesNotTreatDeferredApplicationLambdaAsImmediatePersistenceWrite() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import java.util.function.Supplier;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final DeferredWorkQueue queue = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional(readOnly = true)
+                    void schedule(Order order) {
+                        queue.submit(() -> repository.save(order));
+                    }
+                }
+
+                interface DeferredWorkQueue {
+                    void submit(Supplier<Order> work);
+                }
+
+                interface OrderRepository {
+                    Order save(Order order);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_READONLY_WITH_WRITES.ruleId());
+    }
+
+    @Test
+    void doesNotFlagReadOnlyWritesWithoutProxyEligibleActiveTransaction() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final OrderRepository repository = null;
+
+                    @Transactional(readOnly = true, propagation = Propagation.NOT_SUPPORTED)
+                    void suspended(Order order) {
+                        repository.save(order);
+                    }
+
+                    @Transactional(readOnly = true)
+                    private void privateWrite(Order order) {
+                        repository.save(order);
+                    }
+                }
+
+                interface OrderRepository {
+                    Order save(Order order);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_READONLY_WITH_WRITES.ruleId());
+    }
+
+    @Test
+    void doesNotTreatUnexecutedCallbackParameterAsIndependentTransaction() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import java.util.function.Supplier;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final MultiCallbackExecutor transactions = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional(readOnly = true)
+                    void update(Order order) {
+                        transactions.execute(() -> repository.save(order), () -> {});
+                    }
+                }
+
+                class MultiCallbackExecutor {
+                    @Transactional(propagation = Propagation.REQUIRES_NEW)
+                    <T> T execute(Supplier<T> work, Runnable cleanup) {
+                        cleanup.run();
+                        return null;
+                    }
+                }
+
+                interface OrderRepository {
+                    Order save(Order order);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_READONLY_WITH_WRITES.ruleId());
+    }
+
+    @Test
     void doesNotFlagReadOnlyTransactionWithoutWrites() throws IOException {
         Files.createDirectories(tempDir.resolve("src/main/resources"));
         Path sourceRoot =
@@ -5879,6 +6591,486 @@ interface InventoryClient {
                 .doesNotContain(FindingRules.SPRING_TX_EVENT_LISTENER_WRITE_LOST.ruleId());
     }
 
+    // ── SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED ────────────────────────────────
+
+    @Test
+    void flagsCaughtTransactionalCollaboratorFailureFollowedByStatusWrite() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void complete() {
+                        try {
+                            worker.process();
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional
+                    void process() {}
+                }
+
+                interface OrderRepository {
+                    void save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        Finding finding =
+                findings.stream()
+                        .filter(
+                                candidate ->
+                                        FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED
+                                                .ruleId()
+                                                .equals(candidate.ruleId()))
+                        .findFirst()
+                        .orElseThrow();
+        assertThat(finding.confidence()).isEqualTo(FindingConfidence.MEDIUM);
+    }
+
+    @Test
+    void doesNotFlagWhenAnotherPotentiallyThrowingCallFollowsTransactionalCollaborator()
+            throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final Metrics metrics = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void complete() {
+                        try {
+                            worker.process();
+                            metrics.record();
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional
+                    void process() {}
+                }
+
+                interface Metrics {
+                    void record();
+                }
+
+                interface OrderRepository {
+                    void save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
+    @Test
+    void doesNotFlagSwallowedRuleWithoutProxyEligibleActiveOuterTransaction() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+                    void suspended() {
+                        try {
+                            worker.process();
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+
+                    @Transactional
+                    private void privateComplete() {
+                        try {
+                            worker.process();
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional
+                    void process() {}
+                }
+
+                interface OrderRepository {
+                    void save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
+    @Test
+    void doesNotFlagSwallowedRuleForUnsafeTryExpressionsOrAdditionalStatements()
+            throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final OrderRepository repository = null;
+                    private Order order;
+                    private int status;
+
+                    @Transactional
+                    void unsafeArgument() {
+                        try {
+                            worker.process(order.id);
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+
+                    @Transactional
+                    void arithmeticAfterCall(int divisor) {
+                        try {
+                            worker.process(1);
+                            status = 10 / divisor;
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+
+                    @Transactional
+                    void fieldAccessAfterCall() {
+                        try {
+                            worker.process(1);
+                            status = order.id;
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional
+                    void process(int id) {}
+                }
+
+                interface OrderRepository {
+                    void save(String status);
+                }
+
+                class Order {
+                    int id;
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
+    @Test
+    void flagsFailureStatusWrittenThroughDefaultTransactionTemplate() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+                import org.springframework.transaction.support.TransactionTemplate;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final TransactionTemplate transactions = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void complete() {
+                        try {
+                            worker.process();
+                        } catch (RuntimeException failure) {
+                            transactions.execute(status -> repository.save("FAILED"));
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional
+                    void process() {}
+                }
+
+                interface OrderRepository {
+                    String save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .contains(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
+    @Test
+    void doesNotFlagBroadCatchWithoutTransactionalCollaboratorFailure() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final PayloadParser parser = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void complete(String payload) {
+                        try {
+                            parser.parse(payload);
+                        } catch (RuntimeException failure) {
+                            repository.save("INVALID");
+                        }
+                    }
+                }
+
+                interface PayloadParser {
+                    void parse(String payload);
+                }
+
+                interface OrderRepository {
+                    void save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
+    @Test
+    void doesNotFlagFailureStatusWrittenInSeparateProgrammaticTransaction() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import java.util.function.Supplier;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final TenantTransactionExecutor transactions = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void complete() {
+                        try {
+                            worker.process();
+                        } catch (RuntimeException failure) {
+                            transactions.execute(() -> repository.save("FAILED"));
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional
+                    void process() {}
+                }
+
+                class TenantTransactionExecutor {
+                    @Transactional(propagation = Propagation.REQUIRES_NEW)
+                    <T> T execute(Supplier<T> work) {
+                        return work.get();
+                    }
+                }
+
+                interface OrderRepository {
+                    String save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
+    @Test
+    void doesNotFlagCaughtFailureWhenCatchMarksRollbackOnly() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+                import org.springframework.transaction.interceptor.TransactionAspectSupport;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void complete() {
+                        try {
+                            worker.process();
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                            TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional
+                    void process() {}
+                }
+
+                interface OrderRepository {
+                    void save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
+    @Test
+    void doesNotFlagRequiresNewCollaboratorFailureAsSharedTransactionDoomed() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderManager.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderManager {
+                    private final OrderWorker worker = null;
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void complete() {
+                        try {
+                            worker.process();
+                        } catch (RuntimeException failure) {
+                            repository.save("FAILED");
+                        }
+                    }
+                }
+
+                @Service
+                class OrderWorker {
+                    @Transactional(propagation = Propagation.REQUIRES_NEW)
+                    void process() {}
+                }
+
+                interface OrderRepository {
+                    void save(String status);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED.ruleId());
+    }
+
     // ── SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK ─────────────────────
 
     @Test
@@ -5897,10 +7089,17 @@ interface InventoryClient {
 
                 @Service
                 public class OrderService {
+                    private final OrderRepository repository = null;
+
                     @Transactional
                     public void importOrders() throws IOException {
+                        repository.save(new Object());
                         throw new IOException("boom");
                     }
+                }
+
+                interface OrderRepository {
+                    Object save(Object value);
                 }
                 """);
 
@@ -5909,6 +7108,210 @@ interface InventoryClient {
         assertThat(findings)
                 .extracting(Finding::ruleId)
                 .contains(FindingRules.SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK.ruleId());
+    }
+
+    @Test
+    void doesNotFlagCheckedExceptionThrownBeforePersistenceWrite() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import java.io.IOException;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void importOrders(boolean invalid) throws IOException {
+                        if (invalid) {
+                            throw new IOException("invalid input");
+                        }
+                        repository.save(new Object());
+                    }
+                }
+
+                interface OrderRepository {
+                    Object save(Object value);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(
+                        FindingRules.SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK.ruleId());
+    }
+
+    @Test
+    void doesNotFlagCheckedThrowAfterBranchContainedWrite() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import java.io.IOException;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void importOrders(boolean persist) throws IOException {
+                        if (persist) {
+                            repository.save(new Object());
+                        }
+                        throw new IOException("boom");
+                    }
+                }
+
+                interface OrderRepository {
+                    Object save(Object value);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(
+                        FindingRules.SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK.ruleId());
+    }
+
+    @Test
+    void doesNotFlagCheckedThrowAcrossConditionalReturnPath() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import java.io.IOException;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final OrderRepository repository = null;
+
+                    @Transactional
+                    void importOrders(boolean stop) throws IOException {
+                        repository.save(new Object());
+                        if (stop) {
+                            return;
+                        }
+                        throw new IOException("boom");
+                    }
+                }
+
+                interface OrderRepository {
+                    Object save(Object value);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(
+                        FindingRules.SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK.ruleId());
+    }
+
+    @Test
+    void doesNotFlagCheckedRollbackWithoutProxyEligibleActiveTransaction() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("OrderService.java"),
+                """
+                package com.example.demo;
+
+                import java.io.IOException;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Propagation;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class OrderService {
+                    private final OrderRepository repository = null;
+
+                    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+                    void suspended() throws IOException {
+                        repository.save(new Object());
+                        throw new IOException("boom");
+                    }
+
+                    @Transactional
+                    private void privateImport() throws IOException {
+                        repository.save(new Object());
+                        throw new IOException("boom");
+                    }
+                }
+
+                interface OrderRepository {
+                    Object save(Object value);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(
+                        FindingRules.SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK.ruleId());
+    }
+
+    @Test
+    void doesNotTreatAuthenticationExceptionAsChecked() throws IOException {
+        Files.createDirectories(tempDir.resolve("src/main/resources"));
+        Path sourceRoot =
+                Files.createDirectories(tempDir.resolve("src/main/java/com/example/demo"));
+        Files.writeString(
+                sourceRoot.resolve("LoginService.java"),
+                """
+                package com.example.demo;
+
+                import org.springframework.security.core.AuthenticationException;
+                import org.springframework.stereotype.Service;
+                import org.springframework.transaction.annotation.Transactional;
+
+                @Service
+                class LoginService {
+                    private final LoginRepository repository = null;
+
+                    @Transactional
+                    void login() throws AuthenticationException {
+                        repository.save(new Object());
+                        throw new AuthenticationException("denied") {};
+                    }
+                }
+
+                interface LoginRepository {
+                    Object save(Object value);
+                }
+                """);
+
+        List<Finding> findings = analyzeStaticPractice(tempDir, emptyBuildInfo(List.of()));
+
+        assertThat(findings)
+                .extracting(Finding::ruleId)
+                .doesNotContain(
+                        FindingRules.SPRING_TRANSACTIONAL_CHECKED_EXCEPTION_NO_ROLLBACK.ruleId());
     }
 
     @Test

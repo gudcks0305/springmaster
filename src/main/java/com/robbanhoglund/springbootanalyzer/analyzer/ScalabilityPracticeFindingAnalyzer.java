@@ -7,6 +7,7 @@ import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
@@ -18,6 +19,7 @@ import com.github.javaparser.ast.stmt.DoStmt;
 import com.github.javaparser.ast.stmt.ForEachStmt;
 import com.github.javaparser.ast.stmt.ForStmt;
 import com.github.javaparser.ast.stmt.WhileStmt;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.Finding;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.FindingConfidence;
 import com.robbanhoglund.springbootanalyzer.analyzer.model.FindingFactory;
@@ -87,6 +89,32 @@ public class ScalabilityPracticeFindingAnalyzer {
                     "ScheduledExecutorService",
                     "ThreadPoolExecutor",
                     "ScheduledThreadPoolExecutor");
+    private static final Set<String> SPRING_DATA_REPOSITORY_BASE_TYPES =
+            Set.of(
+                    "Repository",
+                    "CrudRepository",
+                    "ListCrudRepository",
+                    "PagingAndSortingRepository",
+                    "ListPagingAndSortingRepository",
+                    "ReactiveCrudRepository",
+                    "ReactiveSortingRepository",
+                    "RxJava3CrudRepository",
+                    "RxJava3SortingRepository",
+                    "CoroutineCrudRepository",
+                    "CoroutineSortingRepository",
+                    "JpaRepository",
+                    "JpaSpecificationExecutor",
+                    "MongoRepository",
+                    "ReactiveMongoRepository",
+                    "ElasticsearchRepository",
+                    "ReactiveElasticsearchRepository",
+                    "CassandraRepository",
+                    "ReactiveCassandraRepository",
+                    "Neo4jRepository",
+                    "ReactiveNeo4jRepository");
+    private static final Pattern BOUNDED_REFERENCE_REPOSITORY_PATTERN =
+            Pattern.compile(
+                    "(?:Code|Codes|Config|Configuration|Reference|Lookup|Dictionary|Setting|Settings|Constant|Constants)(?=[A-Z]|$)");
 
     /**
      * Analyzes all Java source files under {@code src/main/java} within the given repository root.
@@ -118,6 +146,7 @@ public class ScalabilityPracticeFindingAnalyzer {
         // methods annotated @Transactional(propagation = REQUIRES_NEW).
         Set<String> prototypeTypes = collectPrototypeTypes(sources);
         Set<String> requiresNewMethods = collectRequiresNewMethods(sources);
+        RepositoryTypeIndex repositoryTypes = collectRepositoryTypes(sources);
 
         // Pass 2: per-file analysis
         for (JavaSources.JavaFile file : sources.primaryFiles()) {
@@ -129,6 +158,7 @@ public class ScalabilityPracticeFindingAnalyzer {
                     file.relativePath(),
                     prototypeTypes,
                     requiresNewMethods,
+                    repositoryTypes,
                     runtimeStackAnalysis,
                     findings);
         }
@@ -378,13 +408,14 @@ public class ScalabilityPracticeFindingAnalyzer {
             String relativePath,
             Set<String> prototypeTypes,
             Set<String> requiresNewMethods,
+            RepositoryTypeIndex repositoryTypes,
             RuntimeStackAnalysis runtimeStackAnalysis,
             List<Finding> findings) {
         detectHardcodedFilePaths(cu, relativePath, findings);
         detectRestTemplateNoTimeout(cu, relativePath, findings);
         detectBlockingCalls(cu, relativePath, runtimeStackAnalysis, findings);
         detectUnboundedThreadPool(cu, relativePath, findings);
-        detectUnboundedFindAll(cu, relativePath, findings);
+        detectUnboundedFindAll(cu, relativePath, repositoryTypes, findings);
         detectRestTemplateNewPerRequest(cu, relativePath, findings);
         detectJpaQueryNoPagination(cu, relativePath, findings);
         if (!requiresNewMethods.isEmpty()) {
@@ -1400,8 +1431,233 @@ public class ScalabilityPracticeFindingAnalyzer {
     // Rule: SPRING_UNBOUNDED_FINDALL
     // ---------------------------------------------------------------------------
 
+    private record RepositoryDeclaration(
+            String qualifiedName,
+            CompilationUnit compilationUnit,
+            ClassOrInterfaceDeclaration declaration) {}
+
+    private record RepositoryTypeIndex(
+            Set<String> repositoryTypes,
+            Set<String> boundedRepositoryTypes,
+            Map<String, Set<String>> repositoryTypesBySimpleName) {}
+
+    private RepositoryTypeIndex collectRepositoryTypes(JavaSources sources) {
+        Map<String, RepositoryDeclaration> declarations = new LinkedHashMap<>();
+        Map<String, Set<String>> declarationsBySimpleName = new LinkedHashMap<>();
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
+            CompilationUnit cu = file.compilationUnit();
+            if (cu == null) {
+                continue;
+            }
+            for (ClassOrInterfaceDeclaration declaration :
+                    cu.findAll(ClassOrInterfaceDeclaration.class)) {
+                if (!declaration.isTopLevelType()) {
+                    continue;
+                }
+                String qualifiedName =
+                        declaration
+                                .getFullyQualifiedName()
+                                .orElseGet(
+                                        () ->
+                                                cu.getPackageDeclaration()
+                                                        .map(
+                                                                pkg ->
+                                                                        pkg.getNameAsString()
+                                                                                + "."
+                                                                                + declaration
+                                                                                        .getNameAsString())
+                                                        .orElse(declaration.getNameAsString()));
+                declarations.put(
+                        qualifiedName, new RepositoryDeclaration(qualifiedName, cu, declaration));
+                declarationsBySimpleName
+                        .computeIfAbsent(
+                                declaration.getNameAsString(), ignored -> new LinkedHashSet<>())
+                        .add(qualifiedName);
+            }
+        }
+
+        Set<String> repositoryTypes = new LinkedHashSet<>();
+        for (RepositoryDeclaration candidate : declarations.values()) {
+            if (hasSpringDataRepositoryDefinition(candidate)
+                    || candidate.declaration().getExtendedTypes().stream()
+                            .anyMatch(
+                                    type ->
+                                            isDirectSpringDataRepositoryType(
+                                                    candidate, type, declarations))) {
+                repositoryTypes.add(candidate.qualifiedName());
+            }
+        }
+
+        boolean changed;
+        do {
+            changed = false;
+            for (RepositoryDeclaration candidate : declarations.values()) {
+                if (repositoryTypes.contains(candidate.qualifiedName())) {
+                    continue;
+                }
+                boolean extendsLocalRepository =
+                        candidate.declaration().getExtendedTypes().stream()
+                                .map(
+                                        type ->
+                                                resolveLocalType(
+                                                        candidate.compilationUnit(),
+                                                        type.asString(),
+                                                        declarations,
+                                                        declarationsBySimpleName))
+                                .anyMatch(repositoryTypes::contains);
+                if (extendsLocalRepository) {
+                    changed |= repositoryTypes.add(candidate.qualifiedName());
+                }
+            }
+        } while (changed);
+
+        Set<String> boundedRepositoryTypes = new LinkedHashSet<>();
+        for (String repositoryType : repositoryTypes) {
+            RepositoryDeclaration declaration = declarations.get(repositoryType);
+            if (declaration != null && looksLikeBoundedReferenceRepository(declaration)) {
+                boundedRepositoryTypes.add(repositoryType);
+            }
+        }
+        Map<String, Set<String>> repositoryTypesBySimpleName = new LinkedHashMap<>();
+        for (String repositoryType : repositoryTypes) {
+            repositoryTypesBySimpleName
+                    .computeIfAbsent(simpleName(repositoryType), ignored -> new LinkedHashSet<>())
+                    .add(repositoryType);
+        }
+        return new RepositoryTypeIndex(
+                Set.copyOf(repositoryTypes),
+                Set.copyOf(boundedRepositoryTypes),
+                repositoryTypesBySimpleName);
+    }
+
+    private boolean hasSpringDataRepositoryDefinition(RepositoryDeclaration candidate) {
+        return candidate.declaration().getAnnotations().stream()
+                .anyMatch(
+                        annotation -> {
+                            String annotationName = annotation.getNameAsString();
+                            if (!"RepositoryDefinition".equals(simpleName(annotationName))) {
+                                return false;
+                            }
+                            if ("org.springframework.data.repository.RepositoryDefinition"
+                                    .equals(annotationName)) {
+                                return true;
+                            }
+                            return candidate.compilationUnit().getImports().stream()
+                                    .filter(importDeclaration -> !importDeclaration.isStatic())
+                                    .filter(importDeclaration -> !importDeclaration.isAsterisk())
+                                    .map(importDeclaration -> importDeclaration.getNameAsString())
+                                    .anyMatch(
+                                            "org.springframework.data.repository.RepositoryDefinition"
+                                                    ::equals);
+                        });
+    }
+
+    private boolean isDirectSpringDataRepositoryType(
+            RepositoryDeclaration candidate,
+            ClassOrInterfaceType type,
+            Map<String, RepositoryDeclaration> declarations) {
+        String typeName = type.getNameWithScope();
+        String typeSimpleName = simpleName(typeName);
+        if (!SPRING_DATA_REPOSITORY_BASE_TYPES.contains(typeSimpleName)) {
+            return false;
+        }
+        if (typeName.startsWith("org.springframework.data.")) {
+            return true;
+        }
+        CompilationUnit cu = candidate.compilationUnit();
+        boolean explicitlyImported =
+                cu.getImports().stream()
+                        .filter(importDeclaration -> !importDeclaration.isStatic())
+                        .filter(importDeclaration -> !importDeclaration.isAsterisk())
+                        .map(importDeclaration -> importDeclaration.getNameAsString())
+                        .anyMatch(
+                                imported ->
+                                        imported.startsWith("org.springframework.data.")
+                                                && simpleName(imported).equals(typeSimpleName));
+        if (explicitlyImported) {
+            return true;
+        }
+        String samePackageType =
+                cu.getPackageDeclaration()
+                        .map(pkg -> pkg.getNameAsString() + "." + typeSimpleName)
+                        .orElse(typeSimpleName);
+        if (declarations.containsKey(samePackageType)) {
+            return false;
+        }
+        return cu.getImports().stream()
+                .filter(importDeclaration -> !importDeclaration.isStatic())
+                .filter(importDeclaration -> importDeclaration.isAsterisk())
+                .map(importDeclaration -> importDeclaration.getNameAsString())
+                .anyMatch(imported -> imported.startsWith("org.springframework.data."));
+    }
+
+    private boolean isImportedType(CompilationUnit cu, String typeName, String packagePrefix) {
+        if (typeName.startsWith(packagePrefix + ".")) {
+            return true;
+        }
+        String typeSimpleName = simpleName(typeName);
+        return cu.getImports().stream()
+                .filter(importDeclaration -> !importDeclaration.isStatic())
+                .anyMatch(
+                        importDeclaration -> {
+                            String imported = importDeclaration.getNameAsString();
+                            if (!imported.startsWith(packagePrefix + ".")) {
+                                return false;
+                            }
+                            return importDeclaration.isAsterisk()
+                                    || simpleName(imported).equals(typeSimpleName);
+                        });
+    }
+
+    private String resolveLocalType(
+            CompilationUnit cu,
+            String rawType,
+            Map<String, RepositoryDeclaration> declarations,
+            Map<String, Set<String>> declarationsBySimpleName) {
+        String type = rawType.replaceAll("<.*>", "").trim();
+        if (declarations.containsKey(type)) {
+            return type;
+        }
+        String typeSimpleName = simpleName(type);
+        String importedType =
+                cu.getImports().stream()
+                        .filter(importDeclaration -> !importDeclaration.isStatic())
+                        .filter(importDeclaration -> !importDeclaration.isAsterisk())
+                        .map(importDeclaration -> importDeclaration.getNameAsString())
+                        .filter(imported -> simpleName(imported).equals(typeSimpleName))
+                        .findFirst()
+                        .orElse(null);
+        if (importedType != null && declarations.containsKey(importedType)) {
+            return importedType;
+        }
+        String samePackageType =
+                cu.getPackageDeclaration()
+                        .map(pkg -> pkg.getNameAsString() + "." + typeSimpleName)
+                        .orElse(typeSimpleName);
+        if (declarations.containsKey(samePackageType)) {
+            return samePackageType;
+        }
+        Set<String> candidates = declarationsBySimpleName.getOrDefault(typeSimpleName, Set.of());
+        return candidates.size() == 1 ? candidates.iterator().next() : null;
+    }
+
+    private boolean looksLikeBoundedReferenceRepository(RepositoryDeclaration repository) {
+        if (BOUNDED_REFERENCE_REPOSITORY_PATTERN
+                .matcher(repository.declaration().getNameAsString())
+                .find()) {
+            return true;
+        }
+        return repository.declaration().getExtendedTypes().stream()
+                .flatMap(type -> type.getTypeArguments().stream().flatMap(List::stream))
+                .map(type -> simpleName(type.asString()))
+                .anyMatch(type -> BOUNDED_REFERENCE_REPOSITORY_PATTERN.matcher(type).find());
+    }
+
     private void detectUnboundedFindAll(
-            CompilationUnit cu, String relativePath, List<Finding> findings) {
+            CompilationUnit cu,
+            String relativePath,
+            RepositoryTypeIndex repositoryTypes,
+            List<Finding> findings) {
         for (MethodCallExpr call : cu.findAll(MethodCallExpr.class)) {
             if (!"findAll".equals(call.getNameAsString()) || !call.getArguments().isEmpty()) {
                 continue;
@@ -1410,10 +1666,11 @@ public class ScalabilityPracticeFindingAnalyzer {
             if (receiver == null) {
                 continue;
             }
-            String lower = receiver.toLowerCase(java.util.Locale.ROOT);
-            if (!lower.contains("repository")
-                    && !lower.contains("repo")
-                    && !lower.contains("dao")) {
+            String declaredType = declaredReceiverType(call, receiver);
+            String repositoryType = resolveRepositoryType(cu, declaredType, repositoryTypes);
+            if (repositoryType == null
+                    || repositoryTypes.boundedRepositoryTypes().contains(repositoryType)
+                    || !isHotRuntimeContext(call)) {
                 continue;
             }
             Integer line = call.getBegin().map(p -> p.line).orElse(null);
@@ -1426,9 +1683,10 @@ public class ScalabilityPracticeFindingAnalyzer {
                                             + relativePath
                                             + " loads the whole table into memory.")
                             .whyBadPractice(
-                                    "A no-argument findAll() issues SELECT * with no LIMIT. On a"
-                                        + " table that grows over time this materialises every row"
-                                        + " (and its associations) into the heap at once.")
+                                    "A no-argument findAll() issues an unbounded datastore query."
+                                        + " On a table or collection that grows over time this"
+                                        + " materialises every record (and its associations) into"
+                                        + " the heap at once.")
                             .possibleImpact(
                                     "As the table grows the call causes long GC pauses and"
                                         + " eventually OutOfMemoryError, taking down the instance —"
@@ -1440,20 +1698,251 @@ public class ScalabilityPracticeFindingAnalyzer {
                                         + " and LIMIT. Reserve unbounded findAll() for small,"
                                         + " bounded reference tables only.")
                             .limitations(
-                                    "Medium confidence — flagged by the receiver name containing"
-                                        + " 'repository'/'repo'/'dao'. Small fixed lookup tables"
-                                        + " are a legitimate exception.")
-                            .evidence(receiver + ".findAll() found in " + relativePath + ".")
+                                    "Medium confidence — the receiver's declared type resolves to a"
+                                        + " locally declared Spring Data/@Repository type and the"
+                                        + " call is in a mapped, scheduled, listener, runner, or"
+                                        + " loop context. Static analysis still cannot establish"
+                                        + " table cardinality or prove every call path. Repository"
+                                        + " and domain names that clearly indicate bounded"
+                                        + " code/config/reference data are conservatively skipped.")
+                            .evidence(
+                                    receiver
+                                            + ".findAll() resolves to "
+                                            + repositoryType
+                                            + " in a runtime/hot context in "
+                                            + relativePath
+                                            + ".")
                             .source(relativePath, line)
                             .build());
         }
+    }
+
+    private String declaredReceiverType(MethodCallExpr call, String receiver) {
+        MethodDeclaration method = call.findAncestor(MethodDeclaration.class).orElse(null);
+        if (method != null) {
+            String parameterType =
+                    method.getParameters().stream()
+                            .filter(parameter -> parameter.getNameAsString().equals(receiver))
+                            .map(Parameter::getTypeAsString)
+                            .findFirst()
+                            .orElse(null);
+            if (parameterType != null) {
+                return parameterType;
+            }
+            int callLine = call.getBegin().map(position -> position.line).orElse(Integer.MAX_VALUE);
+            String localType =
+                    method.findAll(VariableDeclarator.class).stream()
+                            .filter(variable -> variable.getNameAsString().equals(receiver))
+                            .filter(
+                                    variable ->
+                                            variable.getBegin()
+                                                    .map(position -> position.line <= callLine)
+                                                    .orElse(true))
+                            .map(variable -> variable.getType().asString())
+                            .reduce((first, second) -> second)
+                            .orElse(null);
+            if (localType != null) {
+                return localType;
+            }
+        }
+        ClassOrInterfaceDeclaration enclosingClass =
+                call.findAncestor(ClassOrInterfaceDeclaration.class).orElse(null);
+        if (enclosingClass == null) {
+            return null;
+        }
+        return enclosingClass.getFields().stream()
+                .flatMap(field -> field.getVariables().stream())
+                .filter(variable -> variable.getNameAsString().equals(receiver))
+                .map(variable -> variable.getType().asString())
+                .findFirst()
+                .orElse(null);
+    }
+
+    private String resolveRepositoryType(
+            CompilationUnit cu, String declaredType, RepositoryTypeIndex repositoryTypes) {
+        if (declaredType == null) {
+            return null;
+        }
+        String type = declaredType.replaceAll("<.*>", "").replace("[]", "").trim();
+        if (repositoryTypes.repositoryTypes().contains(type)) {
+            return type;
+        }
+        String typeSimpleName = simpleName(type);
+        String importedType =
+                cu.getImports().stream()
+                        .filter(importDeclaration -> !importDeclaration.isStatic())
+                        .filter(importDeclaration -> !importDeclaration.isAsterisk())
+                        .map(importDeclaration -> importDeclaration.getNameAsString())
+                        .filter(imported -> simpleName(imported).equals(typeSimpleName))
+                        .findFirst()
+                        .orElse(null);
+        if (importedType != null && repositoryTypes.repositoryTypes().contains(importedType)) {
+            return importedType;
+        }
+        String samePackageType =
+                cu.getPackageDeclaration()
+                        .map(pkg -> pkg.getNameAsString() + "." + typeSimpleName)
+                        .orElse(typeSimpleName);
+        if (repositoryTypes.repositoryTypes().contains(samePackageType)) {
+            return samePackageType;
+        }
+        Set<String> candidates =
+                repositoryTypes
+                        .repositoryTypesBySimpleName()
+                        .getOrDefault(typeSimpleName, Set.of());
+        return candidates.size() == 1 ? candidates.iterator().next() : null;
+    }
+
+    private boolean isHotRuntimeContext(MethodCallExpr call) {
+        MethodDeclaration method = call.findAncestor(MethodDeclaration.class).orElse(null);
+        ClassOrInterfaceDeclaration enclosingClass =
+                call.findAncestor(ClassOrInterfaceDeclaration.class).orElse(null);
+        if (method == null || enclosingClass == null) {
+            return false;
+        }
+        CompilationUnit cu = call.findCompilationUnit().orElse(null);
+        if (cu == null) {
+            return false;
+        }
+        boolean runtimeBean = isImportedSpringBean(cu, enclosingClass);
+        if (!runtimeBean) {
+            return false;
+        }
+        boolean mappedController =
+                hasImportedAnnotation(
+                                cu,
+                                enclosingClass.getAnnotations(),
+                                "org.springframework.web.bind.annotation",
+                                "Controller",
+                                "RestController")
+                        && hasImportedAnnotation(
+                                cu,
+                                method.getAnnotations(),
+                                "org.springframework.web.bind.annotation",
+                                "RequestMapping",
+                                "GetMapping",
+                                "PostMapping",
+                                "PutMapping",
+                                "PatchMapping",
+                                "DeleteMapping");
+        boolean runtimeCallback = hasImportedRuntimeCallback(cu, method);
+        boolean runner =
+                "run".equals(method.getNameAsString())
+                        && enclosingClass.getImplementedTypes().stream()
+                                .anyMatch(
+                                        type ->
+                                                ("CommandLineRunner"
+                                                                        .equals(
+                                                                                simpleName(
+                                                                                        type
+                                                                                                .asString()))
+                                                                || "ApplicationRunner"
+                                                                        .equals(
+                                                                                simpleName(
+                                                                                        type
+                                                                                                .asString())))
+                                                        && isImportedType(
+                                                                cu,
+                                                                type.getNameWithScope(),
+                                                                "org.springframework.boot"));
+        if (mappedController || runtimeCallback || runner) {
+            return true;
+        }
+        if (method.isPrivate()) {
+            return false;
+        }
+        Node current = call;
+        while (current != method) {
+            if (current instanceof ForStmt
+                    || current instanceof ForEachStmt
+                    || current instanceof WhileStmt
+                    || current instanceof DoStmt) {
+                return true;
+            }
+            current = current.getParentNode().orElse(method);
+        }
+        return false;
+    }
+
+    private boolean isImportedSpringBean(
+            CompilationUnit cu, ClassOrInterfaceDeclaration enclosingClass) {
+        return hasImportedAnnotation(
+                        cu,
+                        enclosingClass.getAnnotations(),
+                        "org.springframework.stereotype",
+                        "Component",
+                        "Service",
+                        "Repository",
+                        "Controller")
+                || hasImportedAnnotation(
+                        cu,
+                        enclosingClass.getAnnotations(),
+                        "org.springframework.web.bind.annotation",
+                        "RestController")
+                || hasImportedAnnotation(
+                        cu,
+                        enclosingClass.getAnnotations(),
+                        "org.springframework.context.annotation",
+                        "Configuration")
+                || hasImportedAnnotation(
+                        cu,
+                        enclosingClass.getAnnotations(),
+                        "org.springframework.boot.autoconfigure",
+                        "SpringBootApplication");
+    }
+
+    private boolean hasImportedRuntimeCallback(CompilationUnit cu, MethodDeclaration method) {
+        return hasImportedAnnotation(
+                        cu,
+                        method.getAnnotations(),
+                        "org.springframework.scheduling.annotation",
+                        "Scheduled")
+                || hasImportedAnnotation(
+                        cu,
+                        method.getAnnotations(),
+                        "org.springframework.context.event",
+                        "EventListener")
+                || hasImportedAnnotation(
+                        cu,
+                        method.getAnnotations(),
+                        "org.springframework.transaction.event",
+                        "TransactionalEventListener")
+                || hasImportedAnnotation(
+                        cu,
+                        method.getAnnotations(),
+                        "org.springframework.kafka.annotation",
+                        "KafkaListener")
+                || hasImportedAnnotation(
+                        cu,
+                        method.getAnnotations(),
+                        "org.springframework.amqp.rabbit.annotation",
+                        "RabbitListener")
+                || hasImportedAnnotation(
+                        cu,
+                        method.getAnnotations(),
+                        "org.springframework.jms.annotation",
+                        "JmsListener");
+    }
+
+    private boolean hasImportedAnnotation(
+            CompilationUnit cu,
+            Iterable<AnnotationExpr> annotations,
+            String packagePrefix,
+            String... annotationNames) {
+        for (AnnotationExpr annotation : annotations) {
+            if (matchesAny(simpleName(annotation.getNameAsString()), annotationNames)
+                    && isImportedType(cu, annotation.getNameAsString(), packagePrefix)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String receiverName(Expression scope) {
         if (scope instanceof NameExpr ne) {
             return ne.getNameAsString();
         }
-        if (scope instanceof FieldAccessExpr fae) {
+        if (scope instanceof FieldAccessExpr fae && fae.getScope().isThisExpr()) {
             return fae.getNameAsString();
         }
         return null;

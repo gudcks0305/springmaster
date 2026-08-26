@@ -34,6 +34,20 @@ class CachingPracticeFindingAnalyzerTest {
         return analyzer.analyze(repoRoot);
     }
 
+    private void writeMutableListService() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                public class ProductService {
+                    @Cacheable("products")
+                    public List<String> getAll() { return new java.util.ArrayList<>(); }
+                }
+                """);
+    }
+
     private static Finding byRule(List<Finding> findings, String ruleId) {
         return findings.stream().filter(f -> ruleId.equals(f.ruleId())).findFirst().orElse(null);
     }
@@ -97,6 +111,19 @@ class CachingPracticeFindingAnalyzerTest {
                     public List<String> getAll() { return new java.util.ArrayList<>(); }
                 }
                 """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        return new ConcurrentMapCacheManager();
+                    }
+                }
+                """);
 
         Finding f = byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE");
         assertThat(f).isNotNull();
@@ -117,10 +144,402 @@ class CachingPracticeFindingAnalyzerTest {
                     public Map<String, String> getIndex() { return new java.util.HashMap<>(); }
                 }
                 """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.caffeine.CaffeineCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    CaffeineCacheManager cacheManager() {
+                        return new CaffeineCacheManager();
+                    }
+                }
+                """);
 
         Finding f = byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE");
         assertThat(f).isNotNull();
         assertThat(f.message()).contains("Map");
+    }
+
+    @Test
+    void flagsCacheableListWithCaffeineReferenceStore() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                public class ProductService {
+                    @Cacheable("products")
+                    public List<String> getAll() { return new java.util.ArrayList<>(); }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.caffeine.CaffeineCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    CaffeineCacheManager cacheManager() {
+                        return new CaffeineCacheManager();
+                    }
+                }
+                """);
+
+        Finding f = byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE");
+        assertThat(f).isNotNull();
+        assertThat(f.target()).isEqualTo("ProductService#getAll");
+    }
+
+    @Test
+    void doesNotFlagMutableReturnWhenProviderIsUnresolved() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                public class ProductService {
+                    @Cacheable("products")
+                    public List<String> getAll() { return new java.util.ArrayList<>(); }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.CacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    CacheManager cacheManager() { return cacheManagerFromElsewhere(); }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotFlagMutableReturnWhenRedisSerializesValues() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                public class ProductService {
+                    @Cacheable("products")
+                    public List<String> getAll() { return new java.util.ArrayList<>(); }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.data.redis.cache.RedisCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    RedisCacheManager cacheManager() {
+                        return RedisCacheManager.builder(connectionFactory()).build();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotFlagImmutableListFactoryWithReferenceStoreManager() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                public class ProductService {
+                    @Cacheable("products")
+                    public List<String> getAll() { return List.copyOf(List.of("one")); }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        return new ConcurrentMapCacheManager();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotFlagReferenceStoreConfiguredForStoreByValue() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                public class ProductService {
+                    @Cacheable("products")
+                    public List<String> getAll() { return new java.util.ArrayList<>(); }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        ConcurrentMapCacheManager manager = new ConcurrentMapCacheManager();
+                        manager.setStoreByValue(true);
+                        return manager;
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotTreatUnannotatedCacheManagerMethodNameAsConfiguration() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    ConcurrentMapCacheManager cacheManager() {
+                        return new ConcurrentMapCacheManager();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotTreatCommentsOrUnusedManagerLocalsAsProviderProof() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.CacheManager;
+                import org.springframework.cache.caffeine.CaffeineCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    CacheManager cacheManager() {
+                        // return new CaffeineCacheManager();
+                        CaffeineCacheManager unused = new CaffeineCacheManager();
+                        return cacheManagerFromElsewhere();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotTreatNonCacheManagerBeanAsProviderProof() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    Object cacheProvider() { return new ConcurrentMapCacheManager(); }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotTreatCustomManagerWithSpringSimpleNameAsReferenceStore() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import com.acme.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        return new ConcurrentMapCacheManager();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotTreatCustomCachingConfigurerSuperclassAsSpringOverride() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import com.acme.CachingConfigurerSupport;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration extends CachingConfigurerSupport {
+                    @Override
+                    public ConcurrentMapCacheManager cacheManager() {
+                        return new ConcurrentMapCacheManager();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotFlagMutableReturnWithMethodCacheManagerSelector() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                public class ProductService {
+                    @Cacheable(value = "products", cacheManager = "tenantCacheManager")
+                    public List<String> getAll() { return new java.util.ArrayList<>(); }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        return new ConcurrentMapCacheManager();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotFlagMutableReturnWithClassCacheResolverSelector() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/ProductService.java",
+                """
+                package com.example;
+                import org.springframework.cache.annotation.CacheConfig;
+                import org.springframework.cache.annotation.Cacheable;
+                import java.util.List;
+                @CacheConfig(cacheResolver = "tenantCacheResolver")
+                public class ProductService {
+                    @Cacheable("products")
+                    public List<String> getAll() { return new java.util.ArrayList<>(); }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        return new ConcurrentMapCacheManager();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotFlagWhenStoreByValueUsesBooleanTrue() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        ConcurrentMapCacheManager manager = new ConcurrentMapCacheManager();
+                        manager.setStoreByValue(Boolean.TRUE);
+                        return manager;
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void doesNotFlagWhenStoreByValueUsesProperty() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        ConcurrentMapCacheManager manager = new ConcurrentMapCacheManager();
+                        manager.setStoreByValue(cacheProperties().storeByValue());
+                        return manager;
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNull();
+    }
+
+    @Test
+    void flagsWhenStoreByValueIsExplicitlyFalse() throws IOException {
+        writeMutableListService();
+        writeSourceFile(
+                "src/main/java/com/example/CacheConfiguration.java",
+                """
+                package com.example;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
+                public class CacheConfiguration {
+                    @Bean
+                    ConcurrentMapCacheManager cacheManager() {
+                        ConcurrentMapCacheManager manager = new ConcurrentMapCacheManager();
+                        manager.setStoreByValue(false);
+                        return manager;
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_CACHEABLE_MUTABLE_RETURN_TYPE")).isNotNull();
     }
 
     @Test

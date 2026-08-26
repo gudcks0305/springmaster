@@ -1142,22 +1142,60 @@ class ScalabilityPracticeFindingAnalyzerTest {
     // ── SPRING_UNBOUNDED_FINDALL ──────────────────────────────────────────────
 
     @Test
-    void flagsNoArgFindAllOnRepository() throws IOException {
+    void flagsNoArgFindAllOnResolvedRepositoryInMappedController() throws IOException {
         writeSourceFile(
-                "src/main/java/com/example/UserService.java",
+                "src/main/java/com/example/UserController.java",
                 """
                 package com.example;
                 import java.util.List;
-                import org.springframework.stereotype.Service;
-                @Service
-                public class UserService {
+                import org.springframework.web.bind.annotation.GetMapping;
+                import org.springframework.web.bind.annotation.RestController;
+                @RestController
+                public class UserController {
                     private final UserRepository userRepository = null;
+                    @GetMapping("/users")
                     public List<?> all() {
                         return userRepository.findAll();
                     }
                 }
-                interface UserRepository {
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/UserRepository.java",
+                """
+                package com.example;
+                import java.util.List;
+                import org.springframework.data.repository.Repository;
+                interface UserRepository extends Repository<Object, Long> {
                     List<?> findAll();
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_UNBOUNDED_FINDALL")).isNotNull();
+    }
+
+    @Test
+    void flagsNoArgFindAllOnResolvedRepositoryInsideHotLoop() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/UserRepository.java",
+                """
+                package com.example;
+                import java.util.List;
+                import org.springframework.data.repository.CrudRepository;
+                interface UserRepository extends CrudRepository<Object, Long> {}
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/UserService.java",
+                """
+                package com.example;
+                import org.springframework.stereotype.Service;
+                @Service
+                public class UserService {
+                    private final UserRepository userRepository = null;
+                    public void refresh(int partitions) {
+                        for (int i = 0; i < partitions; i++) {
+                            userRepository.findAll();
+                        }
+                    }
                 }
                 """);
 
@@ -1181,6 +1219,167 @@ class ScalabilityPracticeFindingAnalyzerTest {
                 }
                 interface UserRepository {
                     Object findAll(Pageable p);
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_UNBOUNDED_FINDALL")).isNull();
+    }
+
+    @Test
+    void doesNotFlagBoundedReferenceCodeOrConfigurationRepository() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/CountryCodeRepository.java",
+                """
+                package com.example;
+                import org.springframework.data.repository.CrudRepository;
+                interface CountryCodeRepository extends CrudRepository<Object, Long> {}
+                interface FeatureConfigurationRepository extends CrudRepository<Object, Long> {}
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/CountryController.java",
+                """
+                package com.example;
+                import org.springframework.web.bind.annotation.GetMapping;
+                import org.springframework.web.bind.annotation.RestController;
+                @RestController
+                public class CountryController {
+                    private final CountryCodeRepository repository = null;
+                    private final FeatureConfigurationRepository configurationRepository = null;
+                    @GetMapping("/country-codes")
+                    public Object all() {
+                        return repository.findAll();
+                    }
+                    @GetMapping("/feature-configuration")
+                    public Object configuration() {
+                        return configurationRepository.findAll();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_UNBOUNDED_FINDALL")).isNull();
+    }
+
+    @Test
+    void doesNotFlagNameOnlyFakeRepository() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/UserController.java",
+                """
+                package com.example;
+                import java.util.List;
+                import org.springframework.web.bind.annotation.GetMapping;
+                import org.springframework.web.bind.annotation.RestController;
+                @RestController
+                public class UserController {
+                    private final FakeUserRepository userRepository = null;
+                    @GetMapping("/users")
+                    public List<?> all() {
+                        return userRepository.findAll();
+                    }
+                }
+                interface FakeUserRepository {
+                    List<?> findAll();
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_UNBOUNDED_FINDALL")).isNull();
+    }
+
+    @Test
+    void doesNotFlagCustomStereotypeRepositoryDaoInMappedController() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/UserDao.java",
+                """
+                package com.example;
+                import java.util.List;
+                import org.springframework.stereotype.Repository;
+                @Repository
+                public class UserDao {
+                    public List<?> findAll() {
+                        return List.of();
+                    }
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/UserController.java",
+                """
+                package com.example;
+                import org.springframework.web.bind.annotation.GetMapping;
+                import org.springframework.web.bind.annotation.RestController;
+                @RestController
+                public class UserController {
+                    private final UserDao userDao = null;
+                    @GetMapping("/users")
+                    public Object all() {
+                        return userDao.findAll();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_UNBOUNDED_FINDALL")).isNull();
+    }
+
+    @Test
+    void doesNotTreatWildcardSpringDataImportAsProofWhenLocalTypeShadowsIt() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/CrudRepository.java",
+                """
+                package com.example;
+                import java.util.List;
+                interface CrudRepository<T, ID> {
+                    List<T> findAll();
+                }
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/UserRepository.java",
+                """
+                package com.example;
+                import org.springframework.data.repository.*;
+                interface UserRepository extends CrudRepository<Object, Long> {}
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/UserController.java",
+                """
+                package com.example;
+                import org.springframework.web.bind.annotation.GetMapping;
+                import org.springframework.web.bind.annotation.RestController;
+                @RestController
+                public class UserController {
+                    private final UserRepository userRepository = null;
+                    @GetMapping("/users")
+                    public Object all() {
+                        return userRepository.findAll();
+                    }
+                }
+                """);
+
+        assertThat(byRule(findings(), "SPRING_UNBOUNDED_FINDALL")).isNull();
+    }
+
+    @Test
+    void doesNotFlagResolvedRepositoryInGeneralOrPrivateDeadMethod() throws IOException {
+        writeSourceFile(
+                "src/main/java/com/example/UserRepository.java",
+                """
+                package com.example;
+                import org.springframework.data.repository.CrudRepository;
+                interface UserRepository extends CrudRepository<Object, Long> {}
+                """);
+        writeSourceFile(
+                "src/main/java/com/example/UserService.java",
+                """
+                package com.example;
+                import org.springframework.stereotype.Service;
+                @Service
+                public class UserService {
+                    private final UserRepository userRepository = null;
+                    public Object all() {
+                        return userRepository.findAll();
+                    }
+                    private void deadLoop() {
+                        while (true) {
+                            userRepository.findAll();
+                        }
+                    }
                 }
                 """);
 

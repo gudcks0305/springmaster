@@ -74,6 +74,18 @@ public class CachingPracticeFindingAnalyzer {
                     "Queue",
                     "PriorityQueue");
 
+    /** Cache managers that retain the caller's object reference by default. */
+    private static final Set<String> REFERENCE_STORE_CACHE_MANAGERS =
+            Set.of(
+                    "org.springframework.cache.concurrent.ConcurrentMapCacheManager",
+                    "org.springframework.cache.caffeine.CaffeineCacheManager");
+
+    /** Providers that serialize/cache by value, so the shared-reference premise does not hold. */
+    private static final Set<String> VALUE_ISOLATING_CACHE_MANAGERS =
+            Set.of(
+                    "org.springframework.data.redis.cache.RedisCacheManager",
+                    "org.springframework.cache.jcache.JCacheCacheManager");
+
     /**
      * Analyzes all Java source files under {@code src/main/java} within the given repository root.
      *
@@ -92,10 +104,15 @@ public class CachingPracticeFindingAnalyzer {
      */
     public List<Finding> analyze(JavaSources sources) {
         List<Finding> findings = new ArrayList<>();
+        boolean provenReferenceStoreCacheManager = hasProvenReferenceStoreCacheManager(sources);
         boolean cacheableFound = false;
         for (JavaSources.JavaFile file : sources.primaryFiles()) {
             if (file.compilationUnit() != null) {
-                analyzeSourceFile(file.compilationUnit(), file.relativePath(), findings);
+                analyzeSourceFile(
+                        file.compilationUnit(),
+                        file.relativePath(),
+                        provenReferenceStoreCacheManager,
+                        findings);
             }
             if (!cacheableFound && file.content().contains("@Cacheable")) {
                 cacheableFound = true;
@@ -112,14 +129,20 @@ public class CachingPracticeFindingAnalyzer {
     // ---------------------------------------------------------------------------
 
     private void analyzeSourceFile(
-            CompilationUnit cu, String relativePath, List<Finding> findings) {
+            CompilationUnit cu,
+            String relativePath,
+            boolean provenReferenceStoreCacheManager,
+            List<Finding> findings) {
         for (ClassOrInterfaceDeclaration cls : cu.findAll(ClassOrInterfaceDeclaration.class)) {
-            analyzeClass(cls, relativePath, findings);
+            analyzeClass(cls, relativePath, provenReferenceStoreCacheManager, findings);
         }
     }
 
     private void analyzeClass(
-            ClassOrInterfaceDeclaration cls, String relativePath, List<Finding> findings) {
+            ClassOrInterfaceDeclaration cls,
+            String relativePath,
+            boolean provenReferenceStoreCacheManager,
+            List<Finding> findings) {
         // Collect all cache-annotated method names for self-invocation detection
         Set<String> cachedMethodNames =
                 cls.getMethods().stream()
@@ -129,7 +152,8 @@ public class CachingPracticeFindingAnalyzer {
 
         for (MethodDeclaration method : cls.getMethods()) {
             detectCacheableVoidReturn(cls, method, relativePath, findings);
-            detectCacheableMutableReturnType(cls, method, relativePath, findings);
+            detectCacheableMutableReturnType(
+                    cls, method, relativePath, provenReferenceStoreCacheManager, findings);
             detectCacheOnPrivateMethod(cls, method, relativePath, findings);
             detectCacheEvictWithoutAllEntries(cls, method, relativePath, findings);
             detectCacheSelfInvocation(cls, method, cachedMethodNames, relativePath, findings);
@@ -198,12 +222,22 @@ public class CachingPracticeFindingAnalyzer {
             ClassOrInterfaceDeclaration cls,
             MethodDeclaration method,
             String relativePath,
+            boolean provenReferenceStoreCacheManager,
             List<Finding> findings) {
+        if (!provenReferenceStoreCacheManager) {
+            return;
+        }
         if (!hasCacheAnnotation(method, CACHE_WRITE_ANNOTATIONS)) {
+            return;
+        }
+        if (hasSourceVisibleCacheSelector(cls, method)) {
             return;
         }
         String rawType = rawTypeName(method.getType().asString());
         if (!MUTABLE_COLLECTION_TYPES.contains(rawType)) {
+            return;
+        }
+        if (returnsOnlyKnownImmutableCollection(method)) {
             return;
         }
         Integer line = method.getBegin().map(p -> p.line).orElse(null);
@@ -219,11 +253,11 @@ public class CachingPracticeFindingAnalyzer {
                                         + rawType
                                         + " — callers can corrupt the cached instance.")
                         .whyBadPractice(
-                                "Spring caches the exact object reference returned by the method."
-                                    + " If a caller mutates the returned collection (add, remove,"
-                                    + " clear), those changes are reflected in the cached value."
-                                    + " Subsequent cache hits will return the mutated, corrupted"
-                                    + " data.")
+                                "The configured in-process cache manager stores the exact object"
+                                    + " reference returned by the method. If a caller mutates the"
+                                    + " returned collection (add, remove, clear), those changes are"
+                                    + " reflected in the cached value. Subsequent cache hits will"
+                                    + " return the mutated, corrupted data.")
                         .possibleImpact(
                                 "Silent data corruption in the cache; intermittent bugs that are"
                                         + " hard to reproduce because they depend on call order.")
@@ -241,13 +275,225 @@ public class CachingPracticeFindingAnalyzer {
                                         + relativePath
                                         + ".")
                         .limitations(
-                                "The declared return type may be mutable but the implementation"
-                                        + " may return an immutable instance (e.g. List.of()). The"
-                                        + " risk is still real if a future change returns a mutable"
-                                        + " list.")
+                                "This finding is emitted only when source-visible cache-manager"
+                                        + " configuration proves an in-process reference store."
+                                        + " Indirect, external, or ambiguous cache configuration is"
+                                        + " intentionally not reported.")
                         .source(relativePath, line)
                         .target(target)
                         .build());
+    }
+
+    private static boolean hasSourceVisibleCacheSelector(
+            ClassOrInterfaceDeclaration cls, MethodDeclaration method) {
+        return hasCacheSelector(method.getAnnotations()) || hasCacheSelector(cls.getAnnotations());
+    }
+
+    private static boolean hasCacheSelector(List<AnnotationExpr> annotations) {
+        return annotations.stream()
+                .filter(
+                        annotation -> {
+                            String name = simpleName(annotation.getNameAsString());
+                            return name.equals("Cacheable")
+                                    || name.equals("CachePut")
+                                    || name.equals("CacheConfig");
+                        })
+                .filter(AnnotationExpr::isNormalAnnotationExpr)
+                .flatMap(annotation -> annotation.asNormalAnnotationExpr().getPairs().stream())
+                .map(MemberValuePair::getNameAsString)
+                .anyMatch(name -> name.equals("cacheManager") || name.equals("cacheResolver"));
+    }
+
+    /**
+     * Returns true only when every explicit return is a JDK immutable collection factory. The
+     * declared type alone is not enough: {@code List<String>} can safely hold a {@code List.of}
+     * value.
+     */
+    private static boolean returnsOnlyKnownImmutableCollection(MethodDeclaration method) {
+        if (method.getBody().isEmpty()) {
+            return false;
+        }
+        List<com.github.javaparser.ast.stmt.ReturnStmt> returns =
+                method.getBody().get().findAll(com.github.javaparser.ast.stmt.ReturnStmt.class);
+        return !returns.isEmpty()
+                && returns.stream()
+                        .allMatch(
+                                returnStmt ->
+                                        returnStmt
+                                                .getExpression()
+                                                .map(
+                                                        CachingPracticeFindingAnalyzer
+                                                                ::isKnownImmutableCollectionFactory)
+                                                .orElse(false));
+    }
+
+    private static boolean isKnownImmutableCollectionFactory(
+            com.github.javaparser.ast.expr.Expression expression) {
+        if (!expression.isMethodCallExpr()) {
+            return false;
+        }
+        MethodCallExpr call = expression.asMethodCallExpr();
+        if (!(call.getNameAsString().equals("of") || call.getNameAsString().equals("copyOf"))) {
+            return false;
+        }
+        return call.getScope()
+                .map(scope -> simpleName(scope.toString()))
+                .map(type -> type.equals("List") || type.equals("Set") || type.equals("Map"))
+                .orElse(false);
+    }
+
+    /**
+     * Determines whether project-owned Java configuration proves that every visible cache-manager
+     * choice stores object references. Unknown manager implementations are deliberately treated as
+     * unsafe for this rule: returning no finding is preferable to claiming shared-reference
+     * corruption without provider evidence.
+     */
+    private static boolean hasProvenReferenceStoreCacheManager(JavaSources sources) {
+        boolean referenceStoreConfigured = false;
+        boolean valueIsolatingOrUnknownManagerConfigured = false;
+
+        for (JavaSources.JavaFile file : sources.primaryFiles()) {
+            CompilationUnit cu = file.compilationUnit();
+            if (cu == null) {
+                continue;
+            }
+            for (MethodDeclaration method : cu.findAll(MethodDeclaration.class)) {
+                if (!isCacheManagerConfigurationMethod(method, cu)) {
+                    continue;
+                }
+                if (hasNonLiteralFalseStoreByValue(method)) {
+                    valueIsolatingOrUnknownManagerConfigured = true;
+                    continue;
+                }
+                Optional<String> returnedManagerType = directlyReturnedManagerType(method, cu);
+                if (returnedManagerType.isEmpty()) {
+                    valueIsolatingOrUnknownManagerConfigured = true;
+                    continue;
+                }
+                String managerType = returnedManagerType.get();
+                if (REFERENCE_STORE_CACHE_MANAGERS.contains(managerType)) {
+                    referenceStoreConfigured = true;
+                } else if (VALUE_ISOLATING_CACHE_MANAGERS.contains(managerType)) {
+                    valueIsolatingOrUnknownManagerConfigured = true;
+                } else {
+                    // Custom providers are unknown rather than assumed to retain references.
+                    valueIsolatingOrUnknownManagerConfigured = true;
+                }
+            }
+        }
+        return referenceStoreConfigured && !valueIsolatingOrUnknownManagerConfigured;
+    }
+
+    private static boolean isCacheManagerConfigurationMethod(
+            MethodDeclaration method, CompilationUnit cu) {
+        boolean returnsCacheManager =
+                rawTypeName(method.getType().asString()).endsWith("CacheManager");
+        boolean beanMethod =
+                method.getAnnotations().stream()
+                        .map(annotation -> simpleName(annotation.getNameAsString()))
+                        .anyMatch("Bean"::equals);
+        boolean cachingConfigurerOverride =
+                method.getNameAsString().equals("cacheManager")
+                        && method.getAnnotations().stream()
+                                .map(annotation -> simpleName(annotation.getNameAsString()))
+                                .anyMatch("Override"::equals)
+                        && isExactSpringCachingConfigurerOverride(method, cu);
+        return returnsCacheManager && (beanMethod || cachingConfigurerOverride);
+    }
+
+    private static boolean isExactSpringCachingConfigurerOverride(
+            MethodDeclaration method, CompilationUnit cu) {
+        Optional<ClassOrInterfaceDeclaration> enclosingClass =
+                method.findAncestor(ClassOrInterfaceDeclaration.class);
+        if (enclosingClass.isEmpty()) {
+            return false;
+        }
+        boolean implementsCachingConfigurer =
+                enclosingClass.get().getImplementedTypes().stream()
+                        .map(type -> type.asString())
+                        .map(type -> resolveSourceType(type, cu))
+                        .flatMap(Optional::stream)
+                        .anyMatch("org.springframework.cache.annotation.CachingConfigurer"::equals);
+        boolean extendsCachingConfigurerSupport =
+                enclosingClass.get().getExtendedTypes().stream()
+                        .map(type -> type.asString())
+                        .map(type -> resolveSourceType(type, cu))
+                        .flatMap(Optional::stream)
+                        .anyMatch(
+                                "org.springframework.cache.annotation.CachingConfigurerSupport"
+                                        ::equals);
+        return implementsCachingConfigurer || extendsCachingConfigurerSupport;
+    }
+
+    /**
+     * Recognizes only a single direct {@code return new Manager()} or a local variable initialized
+     * with that expression and directly returned. Helper calls, casts, and multiple branches do not
+     * prove a provider to static analysis.
+     */
+    private static Optional<String> directlyReturnedManagerType(
+            MethodDeclaration method, CompilationUnit cu) {
+        if (method.getBody().isEmpty()) {
+            return Optional.empty();
+        }
+        List<com.github.javaparser.ast.stmt.ReturnStmt> returns =
+                method.getBody().get().findAll(com.github.javaparser.ast.stmt.ReturnStmt.class);
+        if (returns.size() != 1 || returns.getFirst().getExpression().isEmpty()) {
+            return Optional.empty();
+        }
+        com.github.javaparser.ast.expr.Expression returned =
+                returns.getFirst().getExpression().get();
+        if (returned.isObjectCreationExpr()) {
+            return resolveSourceType(returned.asObjectCreationExpr().getTypeAsString(), cu);
+        }
+        if (!returned.isNameExpr()) {
+            return Optional.empty();
+        }
+        String localName = returned.asNameExpr().getNameAsString();
+        List<com.github.javaparser.ast.body.VariableDeclarator> declarations =
+                method.getBody()
+                        .get()
+                        .findAll(com.github.javaparser.ast.body.VariableDeclarator.class);
+        List<com.github.javaparser.ast.body.VariableDeclarator> matchingDeclarations =
+                declarations.stream()
+                        .filter(declaration -> declaration.getNameAsString().equals(localName))
+                        .toList();
+        if (matchingDeclarations.size() != 1) {
+            return Optional.empty();
+        }
+        return matchingDeclarations
+                .getFirst()
+                .getInitializer()
+                .filter(com.github.javaparser.ast.expr.Expression::isObjectCreationExpr)
+                .map(initializer -> initializer.asObjectCreationExpr().getTypeAsString())
+                .flatMap(type -> resolveSourceType(type, cu));
+    }
+
+    /**
+     * Resolves only fully-qualified types and exact single-type imports. Wildcard imports and
+     * same-named project classes remain unknown rather than being mistaken for Spring managers.
+     */
+    private static Optional<String> resolveSourceType(String typeName, CompilationUnit cu) {
+        String rawType = rawTypeName(typeName);
+        if (rawType.contains(".")) {
+            return Optional.of(rawType);
+        }
+        return cu.getImports().stream()
+                .filter(
+                        importDeclaration ->
+                                !importDeclaration.isAsterisk() && !importDeclaration.isStatic())
+                .map(importDeclaration -> importDeclaration.getNameAsString())
+                .filter(importedType -> importedType.endsWith("." + rawType))
+                .findFirst();
+    }
+
+    private static boolean hasNonLiteralFalseStoreByValue(MethodDeclaration method) {
+        return method.findAll(MethodCallExpr.class).stream()
+                .filter(call -> call.getNameAsString().equals("setStoreByValue"))
+                .anyMatch(
+                        call ->
+                                call.getArguments().size() != 1
+                                        || !call.getArgument(0).isBooleanLiteralExpr()
+                                        || call.getArgument(0).asBooleanLiteralExpr().getValue());
     }
 
     // ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ import com.github.javaparser.ast.expr.ClassExpr;
 import com.github.javaparser.ast.expr.DoubleLiteralExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
+import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.LiteralStringValueExpr;
 import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.MethodCallExpr;
@@ -137,7 +138,31 @@ public class StaticPracticeFindingAnalyzer {
                     "NumberFormatException",
                     "ConcurrentModificationException",
                     "NoSuchElementException",
-                    "DataAccessException");
+                    "DataAccessException",
+                    "AuthenticationException",
+                    "AccessDeniedException");
+    private static final Set<String> KNOWN_CHECKED_EXCEPTIONS =
+            Set.of(
+                    "Exception",
+                    "IOException",
+                    "SQLException",
+                    "ParseException",
+                    "ReflectiveOperationException",
+                    "ClassNotFoundException",
+                    "InterruptedException",
+                    "ExecutionException",
+                    "TimeoutException",
+                    "ServletException",
+                    "GeneralSecurityException",
+                    "NamingException");
+    private static final Set<String> PERSISTENCE_INFRASTRUCTURE_TYPES =
+            Set.of(
+                    "EntityManager",
+                    "Session",
+                    "JdbcTemplate",
+                    "NamedParameterJdbcTemplate",
+                    "JdbcClient",
+                    "SimpleJdbcInsert");
     private static final Set<String> IGNORE_VARIABLE_NAMES =
             Set.of("ignored", "ignore", "expected", "intentionallyignored");
     private static final Set<String> BENIGN_IGNORE_COMMENT_MARKERS =
@@ -258,6 +283,8 @@ public class StaticPracticeFindingAnalyzer {
             List<DetectedClass> detectedClasses,
             boolean legacyTransactionalVisibility,
             List<Finding> findings) {
+        TransactionEvidenceIndex transactionEvidence =
+                transactionEvidence(javaSources, legacyTransactionalVisibility);
         Map<String, List<OutboundEndpoint>> outboundByFile =
                 (httpSurfaceAnalysis == null
                                 ? List.<OutboundEndpoint>of()
@@ -290,6 +317,7 @@ public class StaticPracticeFindingAnalyzer {
                     outboundByFile,
                     controllerClasses,
                     legacyTransactionalVisibility,
+                    transactionEvidence,
                     findings);
         }
         detectAsyncWithoutExecutor(javaSources, findings);
@@ -301,6 +329,7 @@ public class StaticPracticeFindingAnalyzer {
             Map<String, List<OutboundEndpoint>> outboundByFile,
             Set<String> controllerClasses,
             boolean legacyTransactionalVisibility,
+            TransactionEvidenceIndex transactionEvidence,
             List<Finding> findings) {
         CompilationUnit compilationUnit = sourceFile.compilationUnit();
         String relativePath = sourceFile.relativePath();
@@ -314,8 +343,415 @@ public class StaticPracticeFindingAnalyzer {
                     outboundByFile.getOrDefault(relativePath, List.of()),
                     controllerClasses,
                     legacyTransactionalVisibility,
+                    transactionEvidence,
                     findings);
         }
+    }
+
+    private TransactionEvidenceIndex transactionEvidence(
+            JavaSources javaSources, boolean legacyTransactionalVisibility) {
+        List<ClassOrInterfaceDeclaration> declarations = new ArrayList<>();
+        for (JavaSources.JavaFile sourceFile : javaSources.primaryFiles()) {
+            if (sourceFile.compilationUnit() != null) {
+                declarations.addAll(
+                        sourceFile.compilationUnit().findAll(ClassOrInterfaceDeclaration.class));
+            }
+        }
+        Map<String, Set<String>> ownersBySimpleName = new LinkedHashMap<>();
+        Map<MethodKey, Integer> methodCounts = new LinkedHashMap<>();
+        Set<MethodKey> participatingTransactionalMethods = new LinkedHashSet<>();
+        Map<MethodKey, Set<Integer>> executedCallbackParameterIndexes = new LinkedHashMap<>();
+        Set<MethodKey> activeCallbackBoundaryMethods = new LinkedHashSet<>();
+        Set<MethodKey> independentCallbackBoundaryMethods = new LinkedHashSet<>();
+        Set<MethodKey> activeMethods = new LinkedHashSet<>();
+        for (ClassOrInterfaceDeclaration declaration : declarations) {
+            String owner = qualifiedTypeName(declaration);
+            ownersBySimpleName
+                    .computeIfAbsent(
+                            declaration.getNameAsString(), ignored -> new LinkedHashSet<>())
+                    .add(owner);
+            for (MethodDeclaration method : declaration.getMethods()) {
+                MethodKey key = methodKey(declaration, method);
+                methodCounts.merge(key, 1, Integer::sum);
+                Set<Integer> callbackIndexes = executedCallbackParameterIndexes(method);
+                boolean executesCallback = !callbackIndexes.isEmpty();
+                if (executesCallback) {
+                    executedCallbackParameterIndexes.put(key, callbackIndexes);
+                }
+                AnnotationExpr annotation = effectiveTransactionalAnnotation(declaration, method);
+                if (annotation == null
+                        || !isEligibleTransactionalProxyMethod(
+                                declaration, method, legacyTransactionalVisibility)
+                        || !transactionalAnnotationOpensActiveBoundary(annotation)) {
+                    continue;
+                }
+                activeMethods.add(key);
+                if (canMarkSharedTransactionRollbackOnly(annotation)) {
+                    participatingTransactionalMethods.add(key);
+                }
+                if (executesCallback) {
+                    activeCallbackBoundaryMethods.add(key);
+                    if ("REQUIRES_NEW".equals(transactionalPropagation(annotation))) {
+                        independentCallbackBoundaryMethods.add(key);
+                    }
+                }
+            }
+        }
+        Set<MethodKey> ambiguousMethods =
+                methodCounts.entrySet().stream()
+                        .filter(entry -> entry.getValue() > 1)
+                        .map(Map.Entry::getKey)
+                        .collect(Collectors.toCollection(LinkedHashSet::new));
+        Set<MethodKey> transactionalCalls = new LinkedHashSet<>();
+        TransactionEvidenceIndex index =
+                new TransactionEvidenceIndex(
+                        participatingTransactionalMethods,
+                        executedCallbackParameterIndexes,
+                        activeCallbackBoundaryMethods,
+                        independentCallbackBoundaryMethods,
+                        transactionalCalls,
+                        ownersBySimpleName,
+                        ambiguousMethods);
+
+        boolean changed;
+        do {
+            changed = false;
+            for (ClassOrInterfaceDeclaration declaration : declarations) {
+                for (MethodDeclaration method : declaration.getMethods()) {
+                    boolean methodActive = activeMethods.contains(methodKey(declaration, method));
+                    for (MethodCallExpr call : method.findAll(MethodCallExpr.class)) {
+                        if (!belongsToMethod(call, method)) {
+                            continue;
+                        }
+                        boolean insideLambda = isInsideLambda(call, method);
+                        boolean insideActiveCallback =
+                                isInsideActiveProgrammaticTransaction(
+                                        call, method, declaration, index);
+                        if ((insideLambda && !insideActiveCallback)
+                                || (!methodActive && !insideActiveCallback)) {
+                            continue;
+                        }
+                        MethodDeclaration helper =
+                                resolveUniqueSameClassCall(declaration, method, call);
+                        if (helper != null) {
+                            changed |= activeMethods.add(methodKey(declaration, helper));
+                            continue;
+                        }
+                        MethodKey target = resolveSourceMethodKey(call, method, declaration, index);
+                        if (target != null && !index.isAmbiguous(target)) {
+                            transactionalCalls.add(target);
+                        }
+                    }
+                }
+            }
+        } while (changed);
+        return index;
+    }
+
+    private boolean transactionalAnnotationOpensActiveBoundary(AnnotationExpr annotation) {
+        return Set.of("REQUIRED", "REQUIRES_NEW", "NESTED", "MANDATORY")
+                .contains(transactionalPropagation(annotation));
+    }
+
+    private boolean canMarkSharedTransactionRollbackOnly(AnnotationExpr annotation) {
+        String propagation = transactionalPropagation(annotation);
+        if (!Set.of("REQUIRED", "MANDATORY").contains(propagation)) {
+            return false;
+        }
+        if (!annotation.isNormalAnnotationExpr()) {
+            return true;
+        }
+        return annotation.asNormalAnnotationExpr().getPairs().stream()
+                .noneMatch(
+                        pair ->
+                                Set.of("noRollbackFor", "noRollbackForClassName")
+                                        .contains(pair.getNameAsString()));
+    }
+
+    private MethodKey methodKey(ClassOrInterfaceDeclaration declaration, MethodDeclaration method) {
+        return new MethodKey(
+                qualifiedTypeName(declaration),
+                method.getNameAsString(),
+                method.getParameters().size());
+    }
+
+    private String qualifiedTypeName(ClassOrInterfaceDeclaration declaration) {
+        String packageName =
+                declaration
+                        .findCompilationUnit()
+                        .flatMap(CompilationUnit::getPackageDeclaration)
+                        .map(value -> value.getNameAsString())
+                        .orElse("");
+        return packageName.isBlank()
+                ? declaration.getNameAsString()
+                : packageName + "." + declaration.getNameAsString();
+    }
+
+    private Set<Integer> executedCallbackParameterIndexes(MethodDeclaration method) {
+        if (method.getBody().isEmpty()) {
+            return Set.of();
+        }
+        Set<String> executedParameters =
+                method.getBody().get().findAll(MethodCallExpr.class).stream()
+                        .filter(
+                                call ->
+                                        Set.of("get", "run", "call", "apply", "accept")
+                                                .contains(call.getNameAsString()))
+                        .filter(
+                                call ->
+                                        call.getScope()
+                                                .filter(NameExpr.class::isInstance)
+                                                .map(NameExpr.class::cast)
+                                                .map(NameExpr::getNameAsString)
+                                                .isPresent())
+                        .filter(call -> isDirectCallbackInvocation(method, call))
+                        .map(call -> call.getScope().orElseThrow().asNameExpr().getNameAsString())
+                        .collect(Collectors.toSet());
+        Set<Integer> indexes = new LinkedHashSet<>();
+        for (int index = 0; index < method.getParameters().size(); index++) {
+            if (executedParameters.contains(method.getParameter(index).getNameAsString())) {
+                indexes.add(index);
+            }
+        }
+        return Set.copyOf(indexes);
+    }
+
+    private boolean isDirectCallbackInvocation(
+            MethodDeclaration method, MethodCallExpr callbackCall) {
+        if (method.getBody().isEmpty()) {
+            return false;
+        }
+        Node parent = callbackCall.getParentNode().orElse(null);
+        if (parent instanceof ExpressionStmt statement) {
+            return statement.getExpression() == callbackCall
+                    && statement.getParentNode().orElse(null) == method.getBody().get();
+        }
+        if (parent instanceof ReturnStmt returnStmt) {
+            return returnStmt.getExpression().orElse(null) == callbackCall
+                    && returnStmt.getParentNode().orElse(null) == method.getBody().get();
+        }
+        return false;
+    }
+
+    private boolean belongsToMethod(Node node, MethodDeclaration method) {
+        return node.findAncestor(MethodDeclaration.class).filter(method::equals).isPresent();
+    }
+
+    private String resolveReceiverType(
+            MethodCallExpr call,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration) {
+        Expression scope = call.getScope().orElse(null);
+        if (scope == null) {
+            return null;
+        }
+        if (scope instanceof ThisExpr) {
+            return declaration.getNameAsString();
+        }
+        if (scope instanceof ObjectCreationExpr creation) {
+            return normalizedTypeName(creation.getTypeAsString());
+        }
+        String variableName = null;
+        if (scope instanceof NameExpr name) {
+            variableName = name.getNameAsString();
+        } else if (scope instanceof FieldAccessExpr access
+                && access.getScope() instanceof ThisExpr) {
+            variableName = access.getNameAsString();
+        }
+        if (variableName == null) {
+            return null;
+        }
+        for (Parameter parameter : method.getParameters()) {
+            if (parameter.getNameAsString().equals(variableName)) {
+                return normalizedTypeName(parameter.getTypeAsString());
+            }
+        }
+        for (VariableDeclarator variable : method.findAll(VariableDeclarator.class)) {
+            if (!variable.getNameAsString().equals(variableName)
+                    || variable.findAncestor(MethodDeclaration.class)
+                            .filter(method::equals)
+                            .isEmpty()) {
+                continue;
+            }
+            if (variable.getType().isVarType()
+                    && variable.getInitializer().orElse(null)
+                            instanceof ObjectCreationExpr creation) {
+                return normalizedTypeName(creation.getTypeAsString());
+            }
+            return normalizedTypeName(variable.getTypeAsString());
+        }
+        for (FieldDeclaration field : declaration.getFields()) {
+            for (VariableDeclarator variable : field.getVariables()) {
+                if (variable.getNameAsString().equals(variableName)) {
+                    return normalizedTypeName(variable.getTypeAsString());
+                }
+            }
+        }
+        return null;
+    }
+
+    private String normalizedTypeName(String rawType) {
+        if (rawType == null || rawType.isBlank()) {
+            return null;
+        }
+        String withoutGenerics = rawType.replaceAll("<.*>", "").replace("[]", "").trim();
+        return simpleName(withoutGenerics);
+    }
+
+    private MethodDeclaration resolveUniqueSameClassCall(
+            ClassOrInterfaceDeclaration declaration,
+            MethodDeclaration caller,
+            MethodCallExpr call) {
+        Expression scope = call.getScope().orElse(null);
+        if (scope != null && !(scope instanceof ThisExpr)) {
+            return null;
+        }
+        List<MethodDeclaration> candidates =
+                declaration.getMethodsByName(call.getNameAsString()).stream()
+                        .filter(candidate -> candidate != caller)
+                        .filter(candidate -> invocationArityMatches(candidate, call))
+                        .toList();
+        return candidates.size() == 1 ? candidates.getFirst() : null;
+    }
+
+    private boolean isInsideLambda(Node node, MethodDeclaration method) {
+        return node.findAncestor(LambdaExpr.class)
+                .filter(lambda -> belongsToMethod(lambda, method))
+                .isPresent();
+    }
+
+    private boolean isInsideActiveProgrammaticTransaction(
+            Node node,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex index) {
+        return enclosingProgrammaticBoundary(
+                node, method, declaration, index, ProgrammaticBoundaryKind.ACTIVE);
+    }
+
+    private boolean isInsideImmediateProgrammaticCallback(
+            Node node,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex index) {
+        return enclosingProgrammaticBoundary(
+                node, method, declaration, index, ProgrammaticBoundaryKind.IMMEDIATE);
+    }
+
+    private boolean isInsideIndependentProgrammaticTransaction(
+            Node node,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex index) {
+        return enclosingProgrammaticBoundary(
+                node, method, declaration, index, ProgrammaticBoundaryKind.INDEPENDENT);
+    }
+
+    private boolean enclosingProgrammaticBoundary(
+            Node node,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex index,
+            ProgrammaticBoundaryKind boundaryKind) {
+        Node current = node;
+        while (current != method && current.getParentNode().isPresent()) {
+            if (current instanceof LambdaExpr lambda) {
+                MethodCallExpr boundary = lambda.findAncestor(MethodCallExpr.class).orElse(null);
+                int callbackArgumentIndex =
+                        boundary == null ? -1 : boundary.getArguments().indexOf(lambda);
+                return boundary != null
+                        && callbackArgumentIndex >= 0
+                        && belongsToMethod(boundary, method)
+                        && isProgrammaticTransactionBoundary(
+                                boundary,
+                                callbackArgumentIndex,
+                                method,
+                                declaration,
+                                index,
+                                boundaryKind);
+            }
+            current = current.getParentNode().get();
+        }
+        return false;
+    }
+
+    private boolean isProgrammaticTransactionBoundary(
+            MethodCallExpr call,
+            int callbackArgumentIndex,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex index,
+            ProgrammaticBoundaryKind boundaryKind) {
+        if (!Set.of("execute", "executeWithoutResult", "executeInTransaction")
+                .contains(call.getNameAsString())) {
+            return false;
+        }
+        String receiverType = resolveReceiverType(call, method, declaration);
+        if (Set.of("TransactionTemplate", "TransactionOperations").contains(receiverType)) {
+            return boundaryKind != ProgrammaticBoundaryKind.INDEPENDENT;
+        }
+        MethodKey target = resolveSourceMethodKey(call, method, declaration, index);
+        if (target == null) {
+            return false;
+        }
+        return switch (boundaryKind) {
+            case IMMEDIATE -> index.executesCallbackArgument(target, callbackArgumentIndex);
+            case ACTIVE ->
+                    index.executesCallbackArgument(target, callbackArgumentIndex)
+                            && index.isActiveCallbackBoundary(target);
+            case INDEPENDENT ->
+                    index.executesCallbackArgument(target, callbackArgumentIndex)
+                            && index.isIndependentCallbackBoundary(target);
+        };
+    }
+
+    private MethodKey resolveSourceMethodKey(
+            MethodCallExpr call,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex index) {
+        String receiverType = resolveReceiverType(call, method, declaration);
+        String owner = resolveSourceOwner(receiverType, declaration, index);
+        if (owner == null) {
+            return null;
+        }
+        MethodKey key = new MethodKey(owner, call.getNameAsString(), call.getArguments().size());
+        return index.isAmbiguous(key) ? null : key;
+    }
+
+    private String resolveSourceOwner(
+            String receiverType,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex index) {
+        if (receiverType == null) {
+            return null;
+        }
+        String simple = simpleName(receiverType);
+        Set<String> candidates = index.ownersBySimpleName().getOrDefault(simple, Set.of());
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        String imported =
+                declaration.findCompilationUnit().stream()
+                        .flatMap(unit -> unit.getImports().stream())
+                        .filter(importDeclaration -> !importDeclaration.isAsterisk())
+                        .map(importDeclaration -> importDeclaration.getNameAsString())
+                        .filter(name -> simpleName(name).equals(simple))
+                        .findFirst()
+                        .orElse(null);
+        if (imported != null && candidates.contains(imported)) {
+            return imported;
+        }
+        String samePackage =
+                declaration
+                        .findCompilationUnit()
+                        .flatMap(CompilationUnit::getPackageDeclaration)
+                        .map(value -> value.getNameAsString() + "." + simple)
+                        .orElse(simple);
+        if (candidates.contains(samePackage)) {
+            return samePackage;
+        }
+        return candidates.size() == 1 ? candidates.iterator().next() : null;
     }
 
     private void analyzeClassSourceSignals(
@@ -325,6 +761,7 @@ public class StaticPracticeFindingAnalyzer {
             List<OutboundEndpoint> outboundEndpoints,
             Set<String> controllerClasses,
             boolean legacyTransactionalVisibility,
+            TransactionEvidenceIndex transactionEvidence,
             List<Finding> findings) {
         if (isGeneratedSource(relativePath, declaration)) {
             return;
@@ -526,6 +963,7 @@ public class StaticPracticeFindingAnalyzer {
                         repositoryLike,
                         legacyTransactionalVisibility,
                         signals,
+                        transactionEvidence,
                         findings);
             }
 
@@ -554,7 +992,16 @@ public class StaticPracticeFindingAnalyzer {
 
             if (hasAnnotation(method.getAnnotations(), "Modifying")
                     && !hasAnnotation(method.getAnnotations(), "Transactional")
-                    && !classTransactional) {
+                    && !classTransactional
+                    && !transactionEvidence.isAmbiguous(
+                            new MethodKey(
+                                    qualifiedTypeName(declaration),
+                                    method.getNameAsString(),
+                                    method.getParameters().size()))
+                    && !transactionEvidence.hasTransactionalCaller(
+                            qualifiedTypeName(declaration),
+                            method.getNameAsString(),
+                            method.getParameters().size())) {
                 detectModifyingNoTransaction(relativePath, declaration, method, findings);
             }
 
@@ -565,7 +1012,14 @@ public class StaticPracticeFindingAnalyzer {
             if (hasAnnotation(method.getAnnotations(), "Transactional") || classTransactional) {
                 detectTransactionIsolationReadUncommitted(
                         relativePath, declaration, method, findings);
-                detectTransactionalExceptionSwallowed(relativePath, declaration, method, findings);
+                if (callerTransactionGuaranteesActiveTransaction(
+                        declaration,
+                        method,
+                        effectiveTransactionalAnnotation(declaration, method),
+                        legacyTransactionalVisibility)) {
+                    detectTransactionalExceptionSwallowed(
+                            relativePath, declaration, method, transactionEvidence, findings);
+                }
                 detectTransactionalHttpCall(relativePath, declaration, method, findings);
             }
 
@@ -2126,9 +2580,10 @@ public class StaticPracticeFindingAnalyzer {
                                         + relativePath
                                         + ".")
                         .limitations(
-                                "Static analysis cannot track whether the calling service supplies"
-                                    + " a transaction boundary, but the @Modifying method itself"
-                                    + " must be within a transaction context.")
+                                "Visible source callers with eligible @Transactional boundaries or"
+                                    + " TransactionTemplate callbacks are suppressed. Reflection,"
+                                    + " unresolved overloads, and callers outside the analyzed"
+                                    + " source may still be missed.")
                         .source(relativePath, line)
                         .target(target)
                         .build());
@@ -3241,29 +3696,202 @@ public class StaticPracticeFindingAnalyzer {
                                         && bool.getValue());
     }
 
-    private boolean methodHasPersistenceWriteCall(MethodDeclaration method) {
-        return method.findAll(MethodCallExpr.class).stream()
+    private boolean methodHasPersistenceWriteInCurrentTransaction(
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex transactionEvidence) {
+        return persistenceWriteCalls(method, declaration).stream()
                 .anyMatch(
                         call ->
-                                call.getScope().isPresent()
-                                        && WRITE_CALL_MARKERS.contains(call.getNameAsString()));
+                                persistenceWriteRunsInCurrentTransaction(
+                                        call, method, declaration, transactionEvidence));
     }
 
-    private String firstCheckedThrownException(MethodDeclaration method) {
+    private List<MethodCallExpr> persistenceWriteCalls(
+            MethodDeclaration method, ClassOrInterfaceDeclaration declaration) {
+        return method.findAll(MethodCallExpr.class).stream()
+                .filter(call -> belongsToMethod(call, method))
+                .filter(call -> isDirectPersistenceWrite(call, method, declaration))
+                .toList();
+    }
+
+    private boolean persistenceWriteRunsInCurrentTransaction(
+            MethodCallExpr call,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex transactionEvidence) {
+        if (!isInsideLambda(call, method)) {
+            return true;
+        }
+        return isInsideImmediateProgrammaticCallback(call, method, declaration, transactionEvidence)
+                && !isInsideIndependentProgrammaticTransaction(
+                        call, method, declaration, transactionEvidence);
+    }
+
+    private boolean isDirectPersistenceWrite(
+            MethodCallExpr call,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration) {
+        if (!WRITE_CALL_MARKERS.contains(call.getNameAsString())) {
+            return false;
+        }
+        String receiverType = resolveReceiverType(call, method, declaration);
+        if (receiverType == null) {
+            return false;
+        }
+        if (receiverType.endsWith("Repository") || receiverType.endsWith("Dao")) {
+            return true;
+        }
+        if (!PERSISTENCE_INFRASTRUCTURE_TYPES.contains(receiverType)) {
+            return false;
+        }
+        if (receiverType.equals("EntityManager") || receiverType.equals("Session")) {
+            return Set.of("persist", "merge", "remove", "delete", "flush")
+                    .contains(call.getNameAsString());
+        }
+        return Set.of("update", "batchUpdate", "execute", "insert", "delete")
+                .contains(call.getNameAsString());
+    }
+
+    private String firstCheckedThrownExceptionAfterWrite(
+            MethodDeclaration method, ClassOrInterfaceDeclaration declaration) {
+        List<MethodCallExpr> writes =
+                persistenceWriteCalls(method, declaration).stream()
+                        .filter(call -> isDirectTopLevelWriteCall(method, call))
+                        .toList();
+        if (writes.isEmpty()) {
+            return null;
+        }
         for (var thrown : method.getThrownExceptions()) {
             String name = simpleName(thrown.asString());
-            if (isCheckedExceptionName(name)) {
+            if (isProvablyCheckedExceptionName(method, name)
+                    && hasTopLevelWriteBeforeEscapingThrow(method, writes, name)) {
                 return name;
             }
         }
         return null;
     }
 
-    private boolean isCheckedExceptionName(String name) {
+    private boolean isProvablyCheckedExceptionName(MethodDeclaration method, String name) {
         if (KNOWN_RUNTIME_EXCEPTIONS.contains(name) || name.endsWith("RuntimeException")) {
             return false;
         }
-        return name.equals("Throwable") || name.endsWith("Exception");
+        if (KNOWN_CHECKED_EXCEPTIONS.contains(name)) {
+            return true;
+        }
+        return method.findCompilationUnit().stream()
+                .flatMap(unit -> unit.findAll(ClassOrInterfaceDeclaration.class).stream())
+                .filter(type -> type.getNameAsString().equals(name))
+                .anyMatch(
+                        type ->
+                                type.getExtendedTypes().stream()
+                                        .map(parent -> simpleName(parent.getNameAsString()))
+                                        .anyMatch(
+                                                parent ->
+                                                        parent.equals("Exception")
+                                                                || KNOWN_CHECKED_EXCEPTIONS
+                                                                        .contains(parent)));
+    }
+
+    private boolean hasTopLevelWriteBeforeEscapingThrow(
+            MethodDeclaration method, List<MethodCallExpr> writes, String checkedType) {
+        if (method.getBody().isEmpty()) {
+            return false;
+        }
+        for (ThrowStmt throwStmt : method.getBody().get().findAll(ThrowStmt.class)) {
+            if (!belongsToMethod(throwStmt, method)
+                    || explicitThrownType(throwStmt) == null
+                    || !checkedType.equals(explicitThrownType(throwStmt))
+                    || isCaughtBeforeMethodExit(throwStmt, checkedType, method)) {
+                continue;
+            }
+            int throwIndex = directTopLevelStatementIndex(method, throwStmt);
+            if (throwIndex < 0) {
+                continue;
+            }
+            for (MethodCallExpr write : writes) {
+                int writeIndex = directTopLevelStatementIndex(method, write);
+                if (writeIndex >= 0
+                        && writeIndex < throwIndex
+                        && hasOnlyStraightLineStatementsBetween(method, writeIndex, throwIndex)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean isDirectTopLevelWriteCall(MethodDeclaration method, MethodCallExpr writeCall) {
+        if (!(writeCall.getParentNode().orElse(null) instanceof ExpressionStmt statement)
+                || method.getBody().isEmpty()) {
+            return false;
+        }
+        return statement.getExpression() == writeCall
+                && statement.getParentNode().orElse(null) == method.getBody().get();
+    }
+
+    private boolean hasOnlyStraightLineStatementsBetween(
+            MethodDeclaration method, int writeIndex, int throwIndex) {
+        List<Statement> statements = method.getBody().orElseThrow().getStatements();
+        for (int index = writeIndex + 1; index < throwIndex; index++) {
+            Statement statement = statements.get(index);
+            if (!(statement instanceof ExpressionStmt) && !(statement instanceof EmptyStmt)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isCaughtBeforeMethodExit(
+            ThrowStmt throwStmt, String thrownType, MethodDeclaration method) {
+        Node current = throwStmt;
+        while (current != method && current.getParentNode().isPresent()) {
+            current = current.getParentNode().get();
+            if (!(current instanceof TryStmt tryStmt)
+                    || !tryStmt.getTryBlock().findAll(ThrowStmt.class).contains(throwStmt)) {
+                continue;
+            }
+            boolean caught =
+                    tryStmt.getCatchClauses().stream()
+                            .flatMap(catchClause -> caughtTypeNames(catchClause).stream())
+                            .anyMatch(
+                                    caughtType ->
+                                            caughtType.equals(thrownType)
+                                                    || caughtType.equals("Exception")
+                                                    || caughtType.equals("Throwable"));
+            if (caught) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String explicitThrownType(ThrowStmt throwStmt) {
+        if (throwStmt.getExpression() instanceof ObjectCreationExpr creation) {
+            return simpleName(creation.getTypeAsString());
+        }
+        return null;
+    }
+
+    private int directTopLevelStatementIndex(MethodDeclaration method, Node node) {
+        if (method.getBody().isEmpty()) {
+            return -1;
+        }
+        BlockStmt body = method.getBody().get();
+        Statement statement;
+        if (node instanceof ThrowStmt throwStmt) {
+            statement = throwStmt;
+        } else if (node instanceof MethodCallExpr call
+                && call.getParentNode().orElse(null) instanceof ExpressionStmt expressionStmt
+                && expressionStmt.getExpression() == call) {
+            statement = expressionStmt;
+        } else {
+            return -1;
+        }
+        if (statement.getParentNode().orElse(null) != body) {
+            return -1;
+        }
+        return body.getStatements().indexOf(statement);
     }
 
     private boolean transactionalRollbackForPresent(
@@ -3289,7 +3917,8 @@ public class StaticPracticeFindingAnalyzer {
                     method.getAnnotationByName("TransactionalEventListener").orElse(null);
             if (listener == null
                     || !isAfterCommitPhase(listener)
-                    || !methodHasPersistenceWriteCall(method)
+                    || persistenceWriteCalls(method, declaration).stream()
+                            .noneMatch(call -> !isInsideLambda(call, method))
                     || runsInRequiresNewTransaction(method, declaration)) {
                 continue;
             }
@@ -3366,10 +3995,15 @@ public class StaticPracticeFindingAnalyzer {
             boolean repositoryLike,
             boolean legacyTransactionalVisibility,
             MethodSignals signals,
+            TransactionEvidenceIndex transactionEvidence,
             List<Finding> findings) {
         boolean transactional =
                 hasAnnotation(method.getAnnotations(), "Transactional")
                         || hasAnnotation(declaration.getAnnotations(), "Transactional");
+        AnnotationExpr callerTransaction = effectiveTransactionalAnnotation(declaration, method);
+        boolean guaranteedActiveTransaction =
+                callerTransactionGuaranteesActiveTransaction(
+                        declaration, method, callerTransaction, legacyTransactionalVisibility);
         Integer line = method.getBegin().map(position -> position.line).orElse(null);
         if (hasAnnotation(method.getAnnotations(), "Transactional") && method.isPrivate()) {
             findings.add(
@@ -3450,9 +4084,10 @@ public class StaticPracticeFindingAnalyzer {
                             .target(declaration.getNameAsString() + "#" + method.getNameAsString())
                             .build());
         }
-        if (transactional
+        if (guaranteedActiveTransaction
                 && isReadOnlyTransactional(method, declaration)
-                && methodHasPersistenceWriteCall(method)) {
+                && methodHasPersistenceWriteInCurrentTransaction(
+                        method, declaration, transactionEvidence)) {
             findings.add(
                     FindingFactory.builder(
                                     FindingRules.SPRING_TRANSACTIONAL_READONLY_WITH_WRITES,
@@ -3475,16 +4110,16 @@ public class StaticPracticeFindingAnalyzer {
                                     "Remove readOnly = true from methods that write, or split the"
                                             + " read and write work into separate transactions.")
                             .limitations(
-                                    "Write calls are matched by name"
-                                            + " (save/update/delete/persist/merge/flush/...); a"
-                                            + " same-named non-persistence call could be a false"
-                                            + " positive.")
+                                    "Only calls on locally resolvable repository, EntityManager, or"
+                                        + " JDBC template receivers are considered. Writes hidden"
+                                        + " behind application-specific abstractions may be"
+                                        + " missed.")
                             .source(relativePath, line)
                             .target(declaration.getNameAsString() + "#" + method.getNameAsString())
                             .build());
         }
-        if (transactional) {
-            String checkedException = firstCheckedThrownException(method);
+        if (guaranteedActiveTransaction) {
+            String checkedException = firstCheckedThrownExceptionAfterWrite(method, declaration);
             if (checkedException != null && !transactionalRollbackForPresent(method, declaration)) {
                 findings.add(
                         FindingFactory.builder(
@@ -3513,10 +4148,10 @@ public class StaticPracticeFindingAnalyzer {
                                             + " Exception.class)), or wrap the checked exception in"
                                             + " a RuntimeException.")
                                 .limitations(
-                                        "Checked vs unchecked is inferred from the declared type"
-                                                + " name without resolution; a custom unchecked"
-                                                + " exception listed in throws would be a false"
-                                                + " positive.")
+                                        "Only known checked types or locally declared subclasses of"
+                                            + " Exception are considered, and a direct persistence"
+                                            + " write must precede an explicit escaping throw."
+                                            + " Indirect throws may be missed.")
                                 .source(relativePath, line)
                                 .target(
                                         declaration.getNameAsString()
@@ -3525,10 +4160,7 @@ public class StaticPracticeFindingAnalyzer {
                                 .build());
             }
         }
-        AnnotationExpr callerTransaction = effectiveTransactionalAnnotation(declaration, method);
-        boolean callerHasActiveTransaction =
-                callerTransactionGuaranteesActiveTransaction(
-                        declaration, method, callerTransaction, legacyTransactionalVisibility);
+        boolean callerHasActiveTransaction = guaranteedActiveTransaction;
         method.findAll(MethodCallExpr.class)
                 .forEach(
                         call -> {
@@ -3919,10 +4551,8 @@ public class StaticPracticeFindingAnalyzer {
         if (annotation == null) {
             return false;
         }
-        boolean methodOverride = transactionalAnnotation(method.getAnnotations()) != null;
-        if (methodOverride
-                && !isEligibleTransactionalProxyMethod(
-                        declaration, method, legacyTransactionalVisibility)) {
+        if (!isEligibleTransactionalProxyMethod(
+                declaration, method, legacyTransactionalVisibility)) {
             return false;
         }
         String propagation = transactionalPropagation(annotation);
@@ -3938,8 +4568,17 @@ public class StaticPracticeFindingAnalyzer {
             return false;
         }
         if (!callerHasActiveTransaction) {
+            // An unannotated entry point may itself be called inside an outer transaction. A plain
+            // REQUIRED callee would simply join it, so reporting that common shape creates far more
+            // noise than signal. Keep only semantics that materially require proxy interception.
+            if (callerAnnotation == null) {
+                return Set.of("REQUIRES_NEW", "NESTED", "NOT_SUPPORTED", "NEVER")
+                                .contains(targetPropagation)
+                        || hasDistinctTransactionalInterceptorSemantics(targetAnnotation);
+            }
             return Set.of("REQUIRED", "REQUIRES_NEW", "NESTED", "MANDATORY")
-                    .contains(targetPropagation);
+                            .contains(targetPropagation)
+                    || hasDistinctTransactionalInterceptorSemantics(targetAnnotation);
         }
         if (Set.of("REQUIRES_NEW", "NESTED", "NOT_SUPPORTED", "NEVER")
                 .contains(targetPropagation)) {
@@ -5589,6 +6228,7 @@ public class StaticPracticeFindingAnalyzer {
             String relativePath,
             ClassOrInterfaceDeclaration declaration,
             MethodDeclaration method,
+            TransactionEvidenceIndex transactionEvidence,
             List<Finding> findings) {
         if (method.getBody().isEmpty()) {
             return;
@@ -5605,7 +6245,12 @@ public class StaticPracticeFindingAnalyzer {
                         analyzeCatchBody(
                                 catchClause.getBody(),
                                 catchClause.getParameter().getNameAsString());
-                if (analysis.rethrows()) {
+                if (analysis.rethrows()
+                        || marksCurrentTransactionRollbackOnly(catchClause.getBody())
+                        || !tryInvokesTransactionalCollaborator(
+                                tryStmt, method, declaration, transactionEvidence)
+                        || !catchWritesInCurrentTransaction(
+                                catchClause, method, declaration, transactionEvidence)) {
                     continue;
                 }
                 Integer line = catchClause.getBegin().map(p -> p.line).orElse(null);
@@ -5613,28 +6258,24 @@ public class StaticPracticeFindingAnalyzer {
                 findings.add(
                         FindingFactory.builder(
                                         FindingRules.SPRING_TRANSACTIONAL_EXCEPTION_SWALLOWED,
-                                        FindingConfidence.HIGH)
+                                        FindingConfidence.MEDIUM)
                                 .shortMessage(
-                                        "@Transactional method catches and swallows a broad"
-                                                + " exception, preventing rollback.")
+                                        "@Transactional method catches a transactional collaborator"
+                                            + " failure and then writes in the same transaction.")
                                 .whyBadPractice(
-                                        "Spring's transaction management only rolls back when an"
-                                                + " exception propagates out of the @Transactional"
-                                                + " method. Catching RuntimeException or Exception"
-                                                + " without rethrowing silently commits a partial"
-                                                + " database write.")
+                                        "A participating transactional collaborator can mark the"
+                                            + " shared transaction rollback-only before throwing."
+                                            + " Catching that failure and recording status in the"
+                                            + " same transaction does not make that status"
+                                            + " durable.")
                                 .possibleImpact(
-                                        "The database may be left in an inconsistent state. Callers"
-                                            + " receive no signal that the operation failed, and"
-                                            + " the committed partial state may cause data"
-                                            + " corruption that is hard to detect later.")
+                                        "The status write may be rolled back and the outer boundary"
+                                            + " can still fail with UnexpectedRollbackException.")
                                 .recommendation(
-                                        "Either let the exception propagate (remove the catch block"
-                                            + " or rethrow), annotate with"
-                                            + " @Transactional(rollbackFor = Exception.class) and"
-                                            + " rethrow, or explicitly call"
-                                            + " TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()"
-                                            + " before handling.")
+                                        "Let the failure propagate, or record the failure state in"
+                                                + " a separate REQUIRES_NEW boundary. A default"
+                                                + " TransactionTemplate still joins the existing"
+                                                + " transaction.")
                                 .evidence(
                                         "Method "
                                                 + target
@@ -5642,16 +6283,103 @@ public class StaticPracticeFindingAnalyzer {
                                                 + relativePath
                                                 + " is @Transactional and catches "
                                                 + String.join(" | ", caughtTypes)
-                                                + " without rethrowing.")
+                                                + " after a visible transactional collaborator"
+                                                + " call, then performs a direct persistence"
+                                                + " write.")
                                 .limitations(
-                                        "Static analysis cannot determine if rollback is handled"
-                                                + " via TransactionAspectSupport or equivalent"
-                                                + " programmatic rollback within the catch block.")
+                                        "Receiver types and collaborator annotations are resolved"
+                                            + " from source declarations only. Custom transaction"
+                                            + " aspects or indirect status writers may be missed.")
                                 .source(relativePath, line)
                                 .target(target)
                                 .build());
             }
         }
+    }
+
+    private boolean marksCurrentTransactionRollbackOnly(BlockStmt catchBody) {
+        return catchBody.findAll(MethodCallExpr.class).stream()
+                .anyMatch(call -> call.getNameAsString().equals("setRollbackOnly"));
+    }
+
+    private boolean tryInvokesTransactionalCollaborator(
+            TryStmt tryStmt,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex transactionEvidence) {
+        BlockStmt tryBody = tryStmt.getTryBlock();
+        List<MethodCallExpr> candidates =
+                tryBody.findAll(MethodCallExpr.class).stream()
+                        .filter(call -> belongsToMethod(call, method))
+                        .filter(call -> isDirectTopLevelCall(tryBody, call))
+                        .filter(
+                                call -> {
+                                    MethodKey target =
+                                            resolveSourceMethodKey(
+                                                    call, method, declaration, transactionEvidence);
+                                    return target != null
+                                            && !target.ownerType()
+                                                    .equals(qualifiedTypeName(declaration))
+                                            && transactionEvidence
+                                                    .isParticipatingTransactionalMethod(target);
+                                })
+                        .toList();
+        if (candidates.size() != 1) {
+            return false;
+        }
+        MethodCallExpr collaborator = candidates.getFirst();
+        ExpressionStmt collaboratorStatement =
+                (ExpressionStmt) collaborator.getParentNode().orElseThrow();
+        if (tryBody.getStatements().size() != 1
+                || tryBody.getStatement(0) != collaboratorStatement
+                || collaboratorStatement.findAll(MethodCallExpr.class).size() != 1
+                || !collaboratorStatement.findAll(ObjectCreationExpr.class).isEmpty()
+                || collaborator.getArguments().stream()
+                        .anyMatch(argument -> !isConservativeSafeCallArgument(argument))) {
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isConservativeSafeCallArgument(Expression argument) {
+        return argument.isNameExpr() || argument.isLiteralExpr() || argument.isThisExpr();
+    }
+
+    private boolean isDirectTopLevelCall(BlockStmt block, MethodCallExpr call) {
+        return call.getParentNode().orElse(null) instanceof ExpressionStmt statement
+                && statement.getExpression() == call
+                && statement.getParentNode().orElse(null) == block;
+    }
+
+    private boolean catchWritesInCurrentTransaction(
+            CatchClause catchClause,
+            MethodDeclaration method,
+            ClassOrInterfaceDeclaration declaration,
+            TransactionEvidenceIndex transactionEvidence) {
+        return catchClause.getBody().findAll(MethodCallExpr.class).stream()
+                .filter(call -> belongsToMethod(call, method))
+                .anyMatch(
+                        call ->
+                                isDirectPersistenceWrite(call, method, declaration)
+                                        && persistenceWriteRunsInCurrentTransaction(
+                                                call, method, declaration, transactionEvidence)
+                                        && isDirectCatchWrite(catchClause.getBody(), call, method));
+    }
+
+    private boolean isDirectCatchWrite(
+            BlockStmt catchBody, MethodCallExpr writeCall, MethodDeclaration method) {
+        if (!isInsideLambda(writeCall, method)) {
+            return isDirectTopLevelCall(catchBody, writeCall);
+        }
+        Node current = writeCall;
+        while (current != method && current.getParentNode().isPresent()) {
+            if (current instanceof LambdaExpr lambda) {
+                MethodCallExpr boundary = lambda.findAncestor(MethodCallExpr.class).orElse(null);
+                return boundary != null && isDirectTopLevelCall(catchBody, boundary);
+            }
+            current = current.getParentNode().get();
+        }
+        return false;
     }
 
     private static final Set<String> HTTP_CLIENT_TYPE_NAMES =
@@ -6058,6 +6786,50 @@ public class StaticPracticeFindingAnalyzer {
 
     private record TransactionalSelfInvocationTarget(
             MethodDeclaration method, AnnotationExpr annotation) {}
+
+    private enum ProgrammaticBoundaryKind {
+        IMMEDIATE,
+        ACTIVE,
+        INDEPENDENT
+    }
+
+    private record MethodKey(String ownerType, String methodName, int arity) {}
+
+    private record TransactionEvidenceIndex(
+            Set<MethodKey> participatingTransactionalMethods,
+            Map<MethodKey, Set<Integer>> executedCallbackParameterIndexes,
+            Set<MethodKey> activeCallbackBoundaryMethods,
+            Set<MethodKey> independentCallbackBoundaryMethods,
+            Set<MethodKey> transactionalCalls,
+            Map<String, Set<String>> ownersBySimpleName,
+            Set<MethodKey> ambiguousMethods) {
+        boolean hasTransactionalCaller(String ownerType, String methodName, int arity) {
+            return transactionalCalls.contains(new MethodKey(ownerType, methodName, arity));
+        }
+
+        boolean isParticipatingTransactionalMethod(MethodKey key) {
+            return participatingTransactionalMethods.contains(key) && !isAmbiguous(key);
+        }
+
+        boolean executesCallbackArgument(MethodKey key, int argumentIndex) {
+            return !isAmbiguous(key)
+                    && executedCallbackParameterIndexes
+                            .getOrDefault(key, Set.of())
+                            .contains(argumentIndex);
+        }
+
+        boolean isActiveCallbackBoundary(MethodKey key) {
+            return activeCallbackBoundaryMethods.contains(key) && !isAmbiguous(key);
+        }
+
+        boolean isIndependentCallbackBoundary(MethodKey key) {
+            return independentCallbackBoundaryMethods.contains(key) && !isAmbiguous(key);
+        }
+
+        boolean isAmbiguous(MethodKey key) {
+            return ambiguousMethods.contains(key);
+        }
+    }
 
     private record MethodSignals(
             boolean httpCalls,
